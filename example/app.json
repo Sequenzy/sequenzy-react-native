@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "Sequenzy example",
+    "slug": "sequenzy-example",
+    "scheme": "sequenzyexample",
+    "version": "1.0.0",
+    "ios": { "bundleIdentifier": "com.sequenzy.example" },
+    "android": { "package": "com.sequenzy.example" },
+    "plugins": ["expo-notifications"],
+    "web": { "bundler": "metro" }
+  }
+}
