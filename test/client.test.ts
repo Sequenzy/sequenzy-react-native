@@ -7,6 +7,7 @@ import {
   PROVIDER_RETRY_MS,
   PUSH_REFRESH_INTERVAL_MS,
   SequenzyClient,
+  normalizeLiveActivityToken,
   type FetchLike,
 } from "../src/client";
 import { parsePushPayload } from "../src/push";
@@ -669,5 +670,152 @@ describe("SequenzyClient screens, commerce, profile and signup", () => {
     expect(
       await client.subscribe({ formId: "form_1", email: "not-an-email" })
     ).toMatchObject({ ok: false, retryable: false });
+  });
+});
+
+describe("Live Activity tokens", () => {
+  let harness: ReturnType<typeof createHarness>;
+  beforeEach(() => {
+    harness = createHarness();
+  });
+
+  const specToken = (name: string) =>
+    contract.requests.find((entry) => entry.name === name)!.body[
+      "token"
+    ] as string;
+  const pushToStart = {
+    kind: "push_to_start" as const,
+    activityType: "DeliveryAttributes",
+    token: specToken("registerLiveActivityPushToStart"),
+  };
+  const update = {
+    kind: "update" as const,
+    activityType: "DeliveryAttributes",
+    activityId: "order-1234",
+    token: specToken("registerLiveActivityUpdate"),
+  };
+  const path = "/api/v1/push/live-activities";
+
+  it("registers push-to-start anonymously and update tokens for the contact", async () => {
+    const client = harness.make();
+    await client.registerLiveActivityToken({
+      ...pushToStart,
+      token: pushToStart.token.toUpperCase(),
+    });
+    expectContract(harness.to(path).at(-1), "registerLiveActivityPushToStart");
+
+    await client.identify(email, identityToken);
+    await client.setPushToken(token);
+    await client.registerLiveActivityToken(update);
+    const request = harness.to(path).at(-1);
+    expectContract(request, "registerLiveActivityUpdate");
+    expect(request!.body["deviceToken"]).toBe(token);
+  });
+
+  it("sends stored tokens again when a contact is identified", async () => {
+    const client = harness.make();
+    await client.registerLiveActivityToken(pushToStart);
+    await client.identify(email, identityToken);
+    const registrations = harness.to(path);
+    expect(registrations).toHaveLength(2);
+    expect(registrations[1]!.body["email"]).toBe(email);
+    await client.identify(email);
+    expect(harness.to(path)).toHaveLength(2);
+  });
+
+  it("moves only push-to-start tokens when another user signs in without reset", async () => {
+    const client = harness.make();
+    await client.identify(email, identityToken);
+    await client.registerLiveActivityToken(pushToStart);
+    await client.registerLiveActivityToken(update);
+    const before = harness.to(path).length;
+    await client.identify("bob@example.com", "seq_wid_bob");
+    const resent = harness.to(path).slice(before);
+    expect(resent.map((request) => request.body["token"])).toEqual([
+      pushToStart.token,
+    ]);
+    expect(await client.getLiveActivityTokens()).toEqual([pushToStart]);
+  });
+
+  it("keeps one token per type and activity, surviving a restart", async () => {
+    const client = harness.make();
+    await client.registerLiveActivityToken(pushToStart);
+    await client.registerLiveActivityToken(update);
+    const rotated = { ...pushToStart, token: "e".repeat(80) };
+    await client.registerLiveActivityToken(rotated);
+    expect(await client.getLiveActivityTokens()).toEqual([update, rotated]);
+    expect(await harness.make().getLiveActivityTokens()).toEqual([
+      update,
+      rotated,
+    ]);
+  });
+
+  it("reports an ended activity once and forgets it", async () => {
+    const client = harness.make();
+    await client.registerLiveActivityToken(update);
+    await client.liveActivityEnded(update.token.toUpperCase());
+    expectContract(
+      harness.to("/api/v1/push/live-activities/remove").at(-1),
+      "endLiveActivity"
+    );
+    await client.liveActivityEnded(update.token);
+    expect(harness.to("/api/v1/push/live-activities/remove")).toHaveLength(1);
+    expect(await client.getLiveActivityTokens()).toEqual([]);
+  });
+
+  it("unlinks on reset and re-registers push-to-start for the new installation", async () => {
+    const client = harness.make();
+    await client.identify(email, identityToken);
+    await client.registerLiveActivityToken(pushToStart);
+    await client.registerLiveActivityToken(update);
+    const before = await client.getAnonymousId();
+    await client.reset();
+    const removals = harness.to("/api/v1/push/live-activities/remove");
+    expect(removals.map((request) => request.body["token"]).sort()).toEqual(
+      [pushToStart.token, update.token].sort()
+    );
+    expect(
+      removals.every((request) => request.body["unlinkSubscriber"] === true)
+    ).toBe(true);
+    const last = harness.to(path).at(-1)!;
+    expect(last.body["token"]).toBe(pushToStart.token);
+    expect(last.body["email"]).toBeUndefined();
+    expect(last.body["anonymousId"]).not.toBe(before);
+    expect(await client.getLiveActivityTokens()).toEqual([pushToStart]);
+  });
+
+  it("ignores invalid tokens", async () => {
+    const client = harness.make();
+    for (const invalid of [
+      { ...update, activityId: undefined },
+      { ...update, activityId: "-x" },
+      { ...pushToStart, activityType: "Delivery Attributes" },
+      { ...pushToStart, token: "nothex" },
+    ]) {
+      await client.registerLiveActivityToken(invalid);
+    }
+    expect(harness.to(path)).toHaveLength(0);
+    expect(await client.getLiveActivityTokens()).toEqual([]);
+  });
+});
+
+describe("normalizeLiveActivityToken", () => {
+  it("drops the activity id from push-to-start tokens and lowercases", () => {
+    expect(
+      normalizeLiveActivityToken({
+        kind: "push_to_start",
+        activityType: "A",
+        activityId: "order-1",
+        token: "AB".repeat(32),
+      })
+    ).toEqual({
+      kind: "push_to_start",
+      activityType: "A",
+      token: "ab".repeat(32),
+    });
+  });
+
+  it("rejects corrupted stored entries", () => {
+    expect(normalizeLiveActivityToken({ kind: "update" } as never)).toBeNull();
   });
 });

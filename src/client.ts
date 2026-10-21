@@ -9,6 +9,7 @@ import type {
   InAppEventType,
   InAppMessage,
   KeyValueStorage,
+  LiveActivityToken,
   LogLevel,
   ProfileUpdate,
   PushPayload,
@@ -77,7 +78,54 @@ const KEYS = {
   pushToken: "pushToken",
   pushRegistration: "pushRegistration",
   profile: "profile",
+  liveActivityTokens: "liveActivityTokens",
 } as const;
+
+/** Stored ActivityKit tokens; the newest are kept. */
+export const MAX_LIVE_ACTIVITY_TOKENS = 32;
+const LIVE_ACTIVITY_TOKEN_PATTERN = /^[0-9a-f]{64,200}$/;
+const LIVE_ACTIVITY_TYPE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const LIVE_ACTIVITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+/** The token as Sequenzy stores it, or null when it cannot be accepted. */
+export function normalizeLiveActivityToken(
+  input: LiveActivityToken
+): LiveActivityToken | null {
+  if (
+    typeof input.token !== "string" ||
+    typeof input.activityType !== "string"
+  ) {
+    return null;
+  }
+  const token = input.token.trim().toLowerCase();
+  const activityType = input.activityType.trim();
+  if (
+    (input.kind !== "push_to_start" && input.kind !== "update") ||
+    !LIVE_ACTIVITY_TOKEN_PATTERN.test(token) ||
+    !LIVE_ACTIVITY_TYPE_PATTERN.test(activityType)
+  ) {
+    return null;
+  }
+  if (input.kind === "push_to_start") {
+    return { kind: input.kind, activityType, token };
+  }
+  const activityId =
+    typeof input.activityId === "string" ? input.activityId.trim() : "";
+  if (!LIVE_ACTIVITY_ID_PATTERN.test(activityId)) return null;
+  return { kind: input.kind, activityType, activityId, token };
+}
+
+/** A newer token for the same type (push-to-start) or activity replaces it. */
+function replacesLiveActivityToken(
+  next: LiveActivityToken,
+  stored: LiveActivityToken
+): boolean {
+  if (next.token === stored.token) return true;
+  if (next.kind !== stored.kind || next.activityType !== stored.activityType) {
+    return false;
+  }
+  return next.kind === "push_to_start" || next.activityId === stored.activityId;
+}
 
 type QueuedEventType = "screen" | "commerce";
 
@@ -195,12 +243,14 @@ export class SequenzyClient {
       email: string;
       registeredAt: number;
     } | null;
+    liveActivityTokens: LiveActivityToken[];
   } = {
     anonymousId: null,
     email: null,
     identityToken: null,
     pushToken: null,
     pushRegistration: null,
+    liveActivityTokens: [],
   };
   private backoffMs = 0;
   private nextAttemptAt: number | null = null;
@@ -270,6 +320,7 @@ export class SequenzyClient {
       pushToken,
       pushRegistration,
       profile,
+      liveActivityTokens,
     ] = await Promise.all([
       this.storage.getItem(KEYS.anonymousId),
       this.storage.getItem(KEYS.email),
@@ -278,6 +329,7 @@ export class SequenzyClient {
       this.storage.getItem(KEYS.pushToken),
       this.storage.getItem(KEYS.pushRegistration),
       this.storage.getItem(KEYS.profile),
+      this.storage.getItem(KEYS.liveActivityTokens),
     ]);
     this.pendingProfile = safeParse<ProfileUpdate>(profile);
     this.state = {
@@ -286,6 +338,7 @@ export class SequenzyClient {
       identityToken,
       pushToken,
       pushRegistration: safeParse(pushRegistration),
+      liveActivityTokens: parseLiveActivityTokens(liveActivityTokens),
     };
     const parsed = safeParse<QueuedEvent[]>(events);
     this.events = Array.isArray(parsed) ? parsed : [];
@@ -358,6 +411,21 @@ export class SequenzyClient {
       this.identityBlocked = false;
       this.providerRetryAt = 0;
       await this.registerPushLocked(previous !== normalized);
+      if (previous !== normalized) {
+        if (previous !== null) {
+          // Another user signed in without reset: the previous user's
+          // running activities stay theirs, and only the device's
+          // push-to-start tokens move to the new contact.
+          this.state.liveActivityTokens = this.state.liveActivityTokens.filter(
+            (token) => token.kind === "push_to_start"
+          );
+          await this.persistLiveActivityTokens();
+        }
+        // Stored ActivityKit tokens link to the contact.
+        for (const token of this.state.liveActivityTokens) {
+          await this.sendLiveActivityToken(token);
+        }
+      }
       await this.flushLocked();
     });
   }
@@ -387,6 +455,15 @@ export class SequenzyClient {
           );
         }
       }
+      const liveTokens = this.state.liveActivityTokens;
+      for (const liveToken of liveTokens) {
+        await this.removeLiveActivityToken(liveToken.token, true);
+      }
+      // A running activity belongs to the previous user; push-to-start
+      // tokens belong to the device and are registered again below.
+      this.state.liveActivityTokens = liveTokens.filter(
+        (liveToken) => liveToken.kind === "push_to_start"
+      );
       this.state.email = null;
       this.state.identityToken = null;
       this.state.pushRegistration = null;
@@ -399,6 +476,7 @@ export class SequenzyClient {
         this.save("identityToken", null),
         this.save("pushRegistration", null),
         this.save("anonymousId", this.state.anonymousId),
+        this.persistLiveActivityTokens(),
         this.persistEvents(),
       ]);
       if (this.retryHandle !== null) this.cancel(this.retryHandle);
@@ -406,6 +484,9 @@ export class SequenzyClient {
       this.backoffMs = 0;
       this.nextAttemptAt = null;
       this.identityBlocked = false;
+      for (const liveToken of this.state.liveActivityTokens) {
+        await this.sendLiveActivityToken(liveToken);
+      }
     });
   }
 
@@ -866,6 +947,138 @@ export class SequenzyClient {
     }
   }
 
+  /**
+   * Registers an ActivityKit push token your native Live Activity code
+   * received (iOS only): `Activity<T>.pushToStartTokenUpdates` as
+   * `push_to_start`, or a running activity's `pushTokenUpdates` as `update`
+   * with its `sequenzy.activityId`. A newer token for the same type or
+   * activity replaces the stored one.
+   */
+  registerLiveActivityToken(input: LiveActivityToken): Promise<void> {
+    return this.run(async () => {
+      if (this.config.platform !== "ios") {
+        this.log("error", "Live Activities are only available on iOS");
+        return;
+      }
+      const token = normalizeLiveActivityToken(input);
+      if (!token) {
+        this.log(
+          "error",
+          "Ignoring a Live Activity token: it needs a hex token, the Swift type name and, for update tokens, the activity's sequenzy.activityId"
+        );
+        return;
+      }
+      this.state.liveActivityTokens = [
+        ...this.state.liveActivityTokens.filter(
+          (stored) => !replacesLiveActivityToken(token, stored)
+        ),
+        token,
+      ].slice(-MAX_LIVE_ACTIVITY_TOKENS);
+      await this.persistLiveActivityTokens();
+      await this.sendLiveActivityToken(token);
+    });
+  }
+
+  /** Reports that an activity ended or was dismissed, so Sequenzy stops sending to it. */
+  liveActivityEnded(rawToken: string): Promise<void> {
+    return this.run(async () => {
+      const token = rawToken.trim().toLowerCase();
+      if (
+        !this.state.liveActivityTokens.some((stored) => stored.token === token)
+      ) {
+        return;
+      }
+      this.state.liveActivityTokens = this.state.liveActivityTokens.filter(
+        (stored) => stored.token !== token
+      );
+      await this.persistLiveActivityTokens();
+      await this.removeLiveActivityToken(token, false);
+    });
+  }
+
+  getLiveActivityTokens(): Promise<LiveActivityToken[]> {
+    return this.run(async () => [...this.state.liveActivityTokens]);
+  }
+
+  private persistLiveActivityTokens(): Promise<void> {
+    return this.save(
+      "liveActivityTokens",
+      this.state.liveActivityTokens.length > 0
+        ? JSON.stringify(this.state.liveActivityTokens)
+        : null
+    );
+  }
+
+  private async sendLiveActivityToken(token: LiveActivityToken): Promise<void> {
+    const base: Record<string, unknown> = {
+      companyId: this.config.companyId,
+      publicKey: this.config.publicKey,
+      kind: token.kind,
+      activityType: token.activityType,
+      ...(token.activityId ? { activityId: token.activityId } : {}),
+      token: token.token,
+      anonymousId: await this.ensureAnonymousId(),
+      // Links the token to this installation's push device, when there is one.
+      ...(this.state.pushToken ? { deviceToken: this.state.pushToken } : {}),
+    };
+    for (const key of ["appVersion", "osVersion"] as const) {
+      const value = this.device[key];
+      if (value) base[key] = value;
+    }
+    const path = "/api/v1/push/live-activities";
+    let response: HttpResponse | null;
+    if (this.state.email) {
+      const result = await this.withIdentity((email, identityToken) =>
+        this.post(path, { ...base, email, identityToken })
+      );
+      if (result.kind === "response") {
+        response = result.response;
+      } else if (result.kind === "failed") {
+        this.log(
+          "info",
+          `Live Activity token registration failed: ${String(result.error)}`
+        );
+        return;
+      } else {
+        // Store it anonymously; Sequenzy can address it once the next
+        // identify links it to the contact.
+        response = await this.post(path, base).catch(() => null);
+      }
+    } else {
+      response = await this.post(path, base).catch((error: unknown) => {
+        this.log(
+          "info",
+          `Live Activity token registration failed: ${String(error)}`
+        );
+        return null;
+      });
+    }
+    if (response && (response.status < 200 || response.status >= 300)) {
+      this.log(
+        "error",
+        `Live Activity token registration failed: HTTP ${response.status} ${errorMessage(response.body)}`
+      );
+    }
+  }
+
+  private async removeLiveActivityToken(
+    token: string,
+    unlinkSubscriber: boolean
+  ): Promise<void> {
+    const response = await this.post("/api/v1/push/live-activities/remove", {
+      companyId: this.config.companyId,
+      publicKey: this.config.publicKey,
+      token,
+      ...(unlinkSubscriber ? { unlinkSubscriber: true } : {}),
+    }).catch(() => null);
+    if (response && (response.status < 200 || response.status >= 300)) {
+      this.log(
+        "error",
+        `Could not report the Live Activity ended (HTTP ${response.status})`
+      );
+    }
+  }
+
   /** Reports a push as delivered or clicked; the payload's click token authenticates it. */
   async reportPush(
     type: "delivered" | "clicked",
@@ -1071,6 +1284,16 @@ export class SequenzyClient {
   }
 
   // endregion
+}
+
+function parseLiveActivityTokens(raw: string | null): LiveActivityToken[] {
+  const parsed = safeParse<unknown>(raw);
+  if (!Array.isArray(parsed)) return [];
+  return parsed.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const token = normalizeLiveActivityToken(entry as LiveActivityToken);
+    return token ? [token] : [];
+  });
 }
 
 function safeParse<T = Record<string, unknown>>(raw: string | null): T | null {

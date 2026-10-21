@@ -128,6 +128,22 @@ export interface PushPayload {
   eventsUrl: string;
 }
 
+/**
+ * An ActivityKit push token from your app's native Live Activity code (iOS).
+ * `push_to_start` tokens (iOS 17.2+, one per ActivityAttributes type) let
+ * your backend start activities; `update` tokens (one per running activity)
+ * let it update and end them.
+ */
+export interface LiveActivityToken {
+  kind: "push_to_start" | "update";
+  /** The Swift ActivityAttributes type name, e.g. "DeliveryAttributes". */
+  activityType: string;
+  /** Update tokens: the activity's `sequenzy.activityId` attribute. */
+  activityId?: string;
+  /** The token data as hex. */
+  token: string;
+}
+
 export type LogLevel = "none" | "error" | "info" | "debug";
 
 export interface DeviceInfo {

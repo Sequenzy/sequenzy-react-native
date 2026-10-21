@@ -16,6 +16,7 @@ import type {
   InAppButton,
   InAppEventType,
   InAppMessage,
+  LiveActivityToken,
   SequenzyConfig,
 } from "./types";
 
@@ -148,6 +149,20 @@ export const Sequenzy = {
    */
   setPushToken(token: string): Promise<void> {
     return requireClient().setPushToken(token);
+  },
+
+  /**
+   * iOS Live Activities: pass the ActivityKit tokens your native code (a
+   * Swift module or a library such as expo-live-activity) receives, so your
+   * backend can start, update and end activities through Sequenzy.
+   */
+  registerLiveActivityToken(token: LiveActivityToken): Promise<void> {
+    return requireClient().registerLiveActivityToken(token);
+  },
+
+  /** Call when an activity ends or is dismissed, with its update token. */
+  liveActivityEnded(token: string): Promise<void> {
+    return requireClient().liveActivityEnded(token);
   },
 
   /**

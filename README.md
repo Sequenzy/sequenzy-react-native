@@ -53,6 +53,19 @@ function Inbox() {
 }
 ```
 
+iOS Live Activities need Swift for the widget and ActivityKit. Forward the
+tokens your native module receives so your backend can start, update and end
+activities through Sequenzy:
+
+```ts
+await Sequenzy.registerLiveActivityToken({ kind: "push_to_start", activityType: "DeliveryAttributes", token });
+await Sequenzy.registerLiveActivityToken({ kind: "update", activityType: "DeliveryAttributes", activityId: "order-1234", token });
+await Sequenzy.liveActivityEnded(token); // when the activity ends or is dismissed
+```
+
+On sign-out, end your running activities in native code before
+`Sequenzy.reset()`, so the next person never sees them.
+
 `SequenzyInAppHost` takes `shouldShow`, `onOpenUrl`, `refreshIntervalMs` and
 `fonts` (map brand font names to fonts your app bundles; on the web the CSS
 stack is used as is).
