@@ -188,8 +188,19 @@ export const Sequenzy = {
     return true;
   },
 
-  fetchMessages(): Promise<InAppMessage[]> {
-    return requireClient().fetchFeed({ kind: "message" });
+  /**
+   * Open in-app messages, for apps that present them themselves. Custom HTML
+   * messages are included only with `includeHtml`.
+   */
+  fetchMessages(
+    options: { includeHtml?: boolean } = {}
+  ): Promise<InAppMessage[]> {
+    return requireClient().fetchFeed({
+      kind: "message",
+      ...(options.includeHtml
+        ? { formats: ["modal", "banner", "fullscreen", "html"] }
+        : {}),
+    });
   },
 
   fetchCards(limit?: number): Promise<InAppMessage[]> {
@@ -201,9 +212,10 @@ export const Sequenzy = {
 
   report(
     type: InAppEventType,
-    message: Pick<InAppMessage, "id">
+    message: Pick<InAppMessage, "id">,
+    buttonId?: string
   ): Promise<boolean> {
-    return requireClient().report(type, message.id);
+    return requireClient().report(type, message.id, buttonId);
   },
 
   /** Reports the click and opens the button's URL. */

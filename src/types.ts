@@ -2,7 +2,8 @@
 export interface InAppMessage {
   id: string;
   kind: "message" | "card";
-  format: "modal" | "banner" | "fullscreen" | null;
+  /** `html`: a custom HTML message, shown by `SequenzyInAppHost` with a `webView`. */
+  format: InAppFormat | null;
   /** Banners: top or bottom. Modals: bottom (a sheet) or center. */
   position: "top" | "bottom" | "center" | null;
   /** Short line above the title; may be missing from older servers. */
@@ -25,7 +26,13 @@ export interface InAppMessage {
   clickCount?: number;
   dismissedAt: string | null;
   readAt: string | null;
+  /** `html` messages: the document to load, with the Sequenzy bridge already in it. */
+  html?: string | null;
+  /** `html` messages: draw a close button over the document. */
+  showCloseButton?: boolean;
 }
+
+export type InAppFormat = "modal" | "banner" | "fullscreen" | "html";
 
 export interface InAppButton {
   label: string;

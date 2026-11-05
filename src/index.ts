@@ -18,5 +18,17 @@ export {
   type InAppMessageViewProps,
 } from "./react/InAppMessageView";
 export { InAppCard, type InAppCardProps } from "./react/InAppCard";
+export {
+  InAppHtmlMessageView,
+  type InAppHtmlMessageViewProps,
+  type InAppHtmlOutcome,
+  type WebViewComponent,
+} from "./react/InAppHtmlMessageView";
+export {
+  IN_APP_HTML_BASE_URL,
+  isAllowedInAppUrl,
+  parseInAppHtmlBridgeMessage,
+  type InAppHtmlBridgeMessage,
+} from "./html";
 export { useInAppCards, type UseInAppCardsResult } from "./react/useInAppCards";
 export type * from "./types";

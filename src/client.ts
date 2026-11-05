@@ -1,3 +1,4 @@
+import { isValidInAppButtonId } from "./html";
 import { defaultStorage, prefixedStorage } from "./storage";
 import type {
   CommerceCart,
@@ -7,6 +8,7 @@ import type {
   DeviceInfo,
   EventProperties,
   InAppEventType,
+  InAppFormat,
   InAppMessage,
   KeyValueStorage,
   LiveActivityToken,
@@ -18,7 +20,7 @@ import type {
   SubscribeResult,
 } from "./types";
 
-export const SDK_VERSION = "0.1.0";
+export const SDK_VERSION = "0.1.1";
 export const DEFAULT_API_BASE_URL = "https://api.sequenzy.com";
 export const MAX_QUEUED_EVENTS = 100;
 export const MAX_BATCH_SIZE = 20;
@@ -1114,9 +1116,17 @@ export class SequenzyClient {
 
   // region In-app
 
-  /** Open messages or cards for the identified contact, in server order. */
+  /**
+   * Open messages or cards for the identified contact, in server order.
+   * `formats` lists the message formats the caller renders; without it the
+   * native formats, so `html` messages arrive only when listed.
+   */
   fetchFeed(
-    options: { kind?: "message" | "card"; limit?: number } = {}
+    options: {
+      kind?: "message" | "card";
+      limit?: number;
+      formats?: InAppFormat[];
+    } = {}
   ): Promise<InAppMessage[]> {
     return this.run(async () => {
       const result = await this.withIdentity((email, identityToken) =>
@@ -1127,6 +1137,7 @@ export class SequenzyClient {
           identityToken,
           ...(options.kind ? { kind: options.kind } : {}),
           ...(options.limit ? { limit: options.limit } : {}),
+          ...(options.formats ? { formats: options.formats } : {}),
         })
       );
       if (result.kind === "not_identified")
@@ -1153,8 +1164,15 @@ export class SequenzyClient {
     });
   }
 
-  /** Reports `displayed`, `clicked`, `dismissed` or `read` for a feed item. */
-  report(type: InAppEventType, messageId: string): Promise<boolean> {
+  /**
+   * Reports `displayed`, `clicked`, `dismissed` or `read` for a feed item.
+   * `buttonId` names the control clicked in a custom HTML message.
+   */
+  report(
+    type: InAppEventType,
+    messageId: string,
+    buttonId?: string
+  ): Promise<boolean> {
     return this.run(async () => {
       const result = await this.withIdentity((email, identityToken) =>
         this.post("/api/v1/in-app/feed/events", {
@@ -1164,6 +1182,9 @@ export class SequenzyClient {
           identityToken,
           messageId,
           type,
+          ...(buttonId && type === "clicked" && isValidInAppButtonId(buttonId)
+            ? { buttonId }
+            : {}),
         })
       );
       const ok =

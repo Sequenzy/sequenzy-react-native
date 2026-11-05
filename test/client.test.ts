@@ -10,6 +10,12 @@ import {
   normalizeLiveActivityToken,
   type FetchLike,
 } from "../src/client";
+import {
+  IN_APP_HTML_MAX_CALLS_PER_DISPLAY,
+  IN_APP_HTML_MAX_MESSAGE_BYTES,
+  isAllowedInAppUrl,
+  parseInAppHtmlBridgeMessage,
+} from "../src/html";
 import { parsePushPayload } from "../src/push";
 import { createMemoryStorage } from "../src/storage";
 
@@ -237,6 +243,34 @@ describe("SequenzyClient contract", () => {
 
     expect(await client.report("displayed", "iam_modal")).toBe(true);
     expectContract(harness.requests.at(-1), "reportInAppEvent");
+  });
+
+  it("fetches custom HTML only when asked and reports button ids", async () => {
+    harness.respondTo(
+      "/api/v1/in-app/feed",
+      200,
+      JSON.parse(fixture("feed-response-html.json"))
+    );
+    const client = harness.make();
+    await client.identify(email, identityToken);
+    const messages = await client.fetchFeed({
+      kind: "message",
+      formats: ["modal", "banner", "fullscreen", "html"],
+    });
+    expectContract(
+      harness.to("/api/v1/in-app/feed").at(-1),
+      "fetchFeedWithHtml"
+    );
+    expect(messages[0]).toMatchObject({
+      id: "iam_html",
+      format: "html",
+      showCloseButton: true,
+    });
+
+    expect(await client.report("clicked", "iam_html", "0")).toBe(true);
+    expectContract(harness.requests.at(-1), "reportInAppHtmlClick");
+    await client.report("clicked", "iam_html", "<b>");
+    expect(harness.requests.at(-1)!.body["buttonId"]).toBeUndefined();
   });
 
   it("unregisters on reset and forgets the user", async () => {
@@ -817,5 +851,36 @@ describe("normalizeLiveActivityToken", () => {
 
   it("rejects corrupted stored entries", () => {
     expect(normalizeLiveActivityToken({ kind: "update" } as never)).toBeNull();
+  });
+});
+
+describe("custom HTML bridge contract", () => {
+  const bridge = JSON.parse(fixture("in-app-html-bridge.json")) as {
+    maxMessageBytes: number;
+    maxCallsPerDisplay: number;
+    valid: Array<{ input: unknown; expected: unknown }>;
+    invalid: unknown[];
+    urls: { allowed: string[]; blocked: string[] };
+  };
+
+  it("parses the shared bridge messages", () => {
+    for (const entry of bridge.valid) {
+      expect(parseInAppHtmlBridgeMessage(JSON.stringify(entry.input))).toEqual(
+        entry.expected as never
+      );
+    }
+    for (const input of bridge.invalid) {
+      expect(parseInAppHtmlBridgeMessage(JSON.stringify(input))).toBeNull();
+    }
+    expect(parseInAppHtmlBridgeMessage("not json")).toBeNull();
+    expect(bridge.maxMessageBytes).toBe(IN_APP_HTML_MAX_MESSAGE_BYTES);
+    expect(bridge.maxCallsPerDisplay).toBe(IN_APP_HTML_MAX_CALLS_PER_DISPLAY);
+  });
+
+  it("allows only https and app links", () => {
+    for (const url of bridge.urls.allowed)
+      expect(isAllowedInAppUrl(url)).toBe(true);
+    for (const url of bridge.urls.blocked)
+      expect(isAllowedInAppUrl(url)).toBe(false);
   });
 });

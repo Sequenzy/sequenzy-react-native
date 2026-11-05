@@ -70,6 +70,21 @@ On sign-out, end your running activities in native code before
 `fonts` (map brand font names to fonts your app bundles; on the web the CSS
 stack is used as is).
 
+## Custom HTML messages
+
+[Custom HTML in-app messages](https://docs.sequenzy.com/concepts/in-app-html-messages) (surveys, Braze-style custom HTML) need
+`react-native-webview`. Install it and pass its `WebView`:
+
+```tsx
+import { WebView } from "react-native-webview";
+
+<SequenzyInAppHost webView={WebView} />;
+```
+
+Without `webView`, HTML messages stay in the feed for an app version that can
+show them. The web view runs incognito with shared and third-party cookies
+off; links open through `onOpenUrl`.
+
 ## Develop
 
 ```bash

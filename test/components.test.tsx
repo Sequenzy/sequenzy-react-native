@@ -5,6 +5,7 @@ import { createElement, type ReactNode } from "react";
 
 const opened: string[] = [];
 const appStateListeners: Array<(state: string) => void> = [];
+const backListeners: Array<() => boolean> = [];
 
 // react-native ships Flow sources that Bun cannot load; host components are
 // plain elements here so the tests exercise the SDK's own logic.
@@ -60,6 +61,14 @@ mock.module("react-native", () => ({
   Linking: {
     openURL: async (url: string) => {
       opened.push(url);
+    },
+  },
+  BackHandler: {
+    addEventListener: (_event: string, listener: () => boolean) => {
+      backListeners.push(listener);
+      return {
+        remove: () => backListeners.splice(backListeners.indexOf(listener), 1),
+      };
     },
   },
   AppState: {
@@ -118,8 +127,12 @@ async function configure() {
         const body = JSON.parse(init.body);
         calls.push({ path, body });
         if (path === "/api/v1/in-app/feed") {
+          // Like the server: html items only for callers that list html.
           const messages = feedMessages.filter(
-            (message: any) => !body.kind || message.kind === body.kind
+            (message: any) =>
+              (!body.kind || message.kind === body.kind) &&
+              (message.format !== "html" ||
+                (body.formats ?? []).includes("html"))
           );
           return {
             status: 200,
@@ -547,5 +560,227 @@ describe("message layouts", () => {
     });
     await settle();
     expect(reports("dismissed")).toEqual(["iam_modal"]);
+  });
+});
+
+describe("custom HTML messages", () => {
+  const htmlFeed = JSON.parse(
+    readFileSync(
+      join(import.meta.dir, "../../contract/fixtures/feed-response-html.json"),
+      "utf8"
+    )
+  );
+  const FakeWebView = host("WebView");
+  const webViewOf = (renderer: ReturnType<typeof create>) =>
+    renderer.root.findByType("WebView" as never);
+  const overlayOf = (renderer: ReturnType<typeof create>) =>
+    renderer.root.findAll(
+      (node) => node.type === "View" && "accessibilityViewIsModal" in node.props
+    )[0]!;
+
+  beforeEach(() => {
+    feedMessages = [...htmlFeed.messages, ...feed.messages];
+    backListeners.length = 0;
+  });
+
+  it("stays in the feed when the app passes no WebView", async () => {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<SequenzyInAppHost />);
+    });
+    await settle();
+    expect(renderer.root.findAllByType("WebView" as never)).toHaveLength(0);
+    const feedCall = calls.find((call) => call.path === "/api/v1/in-app/feed");
+    expect(feedCall?.body["formats"]).toBeUndefined();
+    expect(reports("displayed")).toEqual(["iam_modal"]);
+  });
+
+  it("loads the document sandboxed and reports displayed only once loaded", async () => {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<SequenzyInAppHost webView={FakeWebView} />);
+    });
+    await settle();
+    const feedCall = calls.find((call) => call.path === "/api/v1/in-app/feed");
+    expect(feedCall?.body["formats"]).toEqual([
+      "modal",
+      "banner",
+      "fullscreen",
+      "html",
+    ]);
+    const web = webViewOf(renderer);
+    expect(web.props.source).toEqual({
+      html: htmlFeed.messages[0].html,
+      baseUrl: "https://in-app.sequenzy.com/",
+    });
+    expect(web.props).toMatchObject({
+      incognito: true,
+      sharedCookiesEnabled: false,
+      thirdPartyCookiesEnabled: false,
+      allowFileAccess: false,
+      setSupportMultipleWindows: false,
+      originWhitelist: ["*"],
+    });
+    // Touches reach the app while it loads; nothing is reported yet.
+    expect(overlayOf(renderer).props.pointerEvents).toBe("none");
+    expect(reports("displayed")).toEqual([]);
+    expect(
+      renderer.root.findAllByProps({ accessibilityLabel: "Close" })
+    ).toHaveLength(0);
+
+    await act(async () => web.props.onLoadEnd());
+    await settle();
+    expect(reports("displayed")).toEqual(["iam_html"]);
+    expect(overlayOf(renderer).props.pointerEvents).toBe("auto");
+    expect(
+      renderer.root.findAllByProps({ accessibilityLabel: "Close" }).length
+    ).toBeGreaterThan(0);
+
+    // The document's own load and embedded frames are allowed; other
+    // main-frame navigations open through the app instead.
+    const decide = webViewOf(renderer).props.onShouldStartLoadWithRequest;
+    expect(
+      decide({ url: "https://in-app.sequenzy.com/", isTopFrame: true })
+    ).toBe(true);
+    expect(
+      decide({ url: "https://player.example.com/embed", isTopFrame: false })
+    ).toBe(true);
+    expect(decide({ url: "javascript:alert(1)", isTopFrame: true })).toBe(
+      false
+    );
+    // Hash routing inside the document stays inside it.
+    expect(
+      decide({ url: "https://in-app.sequenzy.com/#step-2", isTopFrame: true })
+    ).toBe(true);
+    // Android does not say which frame asked: https loads stay (an embedded
+    // frame must not close the message), app links still go to the app.
+    expect(decide({ url: "https://player.example.com/embed" })).toBe(true);
+    expect(opened).toEqual([]);
+  });
+
+  it("runs bridge calls for the contact and closes on openUrl", async () => {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<SequenzyInAppHost webView={FakeWebView} />);
+    });
+    await settle();
+    await act(async () => webViewOf(renderer).props.onLoadEnd());
+    const post = async (message: unknown) =>
+      act(async () =>
+        webViewOf(renderer).props.onMessage({
+          nativeEvent: { data: JSON.stringify(message) },
+        })
+      );
+    await post({
+      __sequenzyInApp: 1,
+      method: "logClick",
+      args: { buttonId: "q1" },
+    });
+    await post({
+      __sequenzyInApp: 1,
+      method: "setAttributes",
+      args: { attributes: { nps_score: 10 } },
+    });
+    await post({
+      __sequenzyInApp: 1,
+      method: "track",
+      args: { name: "nps", properties: { score: 10 } },
+    });
+    await post({ __sequenzyInApp: 1, method: "eval", args: {} });
+    await act(async () => Sequenzy.flush());
+    await settle();
+    const clicks = calls.filter(
+      (call) =>
+        call.path === "/api/v1/in-app/feed/events" &&
+        call.body.type === "clicked"
+    );
+    expect(clicks.map((call) => call.body["buttonId"])).toEqual(["q1"]);
+    expect(
+      calls.find((call) => call.path === "/api/v1/app-attributes")?.body[
+        "attributes"
+      ]
+    ).toEqual({ nps_score: 10 });
+    expect(
+      calls
+        .filter((call) => call.path === "/api/v1/app-events")
+        .flatMap((call) => call.body["events"])
+        .map((event: { name: string }) => event.name)
+    ).toContain("nps");
+
+    await post({
+      __sequenzyInApp: 1,
+      method: "openUrl",
+      args: { url: "myapp://plans", buttonId: "upgrade" },
+    });
+    await settle();
+    expect(opened).toEqual(["myapp://plans"]);
+    expect(reports("clicked")).toEqual(["iam_html", "iam_html"]);
+    // The next message (the native modal) takes its place.
+    expect(renderer.root.findAllByType("WebView" as never)).toHaveLength(0);
+    expect(reports("displayed")).toEqual(["iam_html", "iam_modal"]);
+  });
+
+  it("drops the previous contact's document and its bridge calls after identify", async () => {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<SequenzyInAppHost webView={FakeWebView} />);
+    });
+    await settle();
+    const stale = webViewOf(renderer);
+    await act(async () => stale.props.onLoadEnd());
+    await settle();
+    const postFromStale = stale.props.onMessage;
+    feedMessages = [];
+    await act(async () => {
+      await Sequenzy.identify("bob@example.com", "seq_wid_bob");
+    });
+    await settle();
+    expect(renderer.root.findAllByType("WebView" as never)).toHaveLength(0);
+    // A call already on its way from Jane's survey is not sent as Bob.
+    await act(async () =>
+      postFromStale({
+        nativeEvent: {
+          data: JSON.stringify({
+            __sequenzyInApp: 1,
+            method: "setAttributes",
+            args: { attributes: { nps_score: 2 } },
+          }),
+        },
+      })
+    );
+    await act(async () => Sequenzy.flush());
+    await settle();
+    expect(
+      calls.filter((call) => call.path === "/api/v1/app-attributes")
+    ).toEqual([]);
+    expect(reports("dismissed")).toEqual([]);
+  });
+
+  it("closes with the close button, Android back and the bridge, reporting dismissed", async () => {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<SequenzyInAppHost webView={FakeWebView} />);
+    });
+    await settle();
+    // Back does nothing until the document is on screen.
+    expect(backListeners.map((listener) => listener())).toEqual([false]);
+    await act(async () => webViewOf(renderer).props.onLoadEnd());
+    await act(async () => {
+      expect(backListeners[0]!()).toBe(true);
+    });
+    await settle();
+    expect(reports("dismissed")).toEqual(["iam_html"]);
+  });
+
+  it("drops a document that never loads without reporting it", async () => {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<SequenzyInAppHost webView={FakeWebView} />);
+    });
+    await settle();
+    await act(async () => webViewOf(renderer).props.onError());
+    await settle();
+    expect(reports("displayed")).toEqual(["iam_modal"]);
+    expect(reports("dismissed")).toEqual([]);
   });
 });

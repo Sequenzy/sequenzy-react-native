@@ -4,6 +4,10 @@ import { AppState, Linking } from "react-native";
 import { Sequenzy } from "../sequenzy";
 import type { InAppButton, InAppMessage } from "../types";
 
+import {
+  InAppHtmlMessageView,
+  type WebViewComponent,
+} from "./InAppHtmlMessageView";
 import { InAppMessageView } from "./InAppMessageView";
 
 export interface SequenzyInAppHostProps {
@@ -20,6 +24,12 @@ export interface SequenzyInAppHostProps {
    * react-native-safe-area-context when the app uses it.
    */
   insets?: { top?: number; bottom?: number };
+  /**
+   * `WebView` from react-native-webview. Pass it to show custom HTML in-app
+   * messages (surveys, Braze-style custom HTML); without it they stay in the
+   * feed for an app version that can show them.
+   */
+  webView?: WebViewComponent;
 }
 
 /**
@@ -33,7 +43,9 @@ export function SequenzyInAppHost({
   refreshIntervalMs = 60_000,
   fonts,
   insets,
+  webView,
 }: SequenzyInAppHostProps) {
+  const showsHtml = webView !== undefined;
   const [current, setCurrent] = useState<InAppMessage | null>(null);
   const queue = useRef<InAppMessage[]>([]);
   const shown = useRef(new Set<string>());
@@ -45,6 +57,15 @@ export function SequenzyInAppHost({
   // must stay pure (StrictMode runs them twice), so the queue is never
   // touched inside one.
   const visible = useRef<InAppMessage | null>(null);
+  // The contact the queued and visible messages were fetched for.
+  const owner = useRef<string | null>(null);
+
+  const clearMessages = useCallback(() => {
+    queue.current = [];
+    shown.current.clear();
+    visible.current = null;
+    setCurrent(null);
+  }, []);
 
   const showNext = useCallback(() => {
     if (visible.current) return;
@@ -66,17 +87,27 @@ export function SequenzyInAppHost({
       // that ran a moment after it was scheduled.
       if (!force && now - lastFetch.current < refreshIntervalMs * 0.9) return;
       lastFetch.current = now;
-      const messages = await Sequenzy.fetchMessages().catch(() => null);
-      if (!messages) return;
+      // Another contact signed in: the previous one's messages go.
+      const email = await client.getEmail();
+      if (email !== owner.current) {
+        clearMessages();
+        owner.current = email;
+      }
+      const messages = await Sequenzy.fetchMessages({
+        includeHtml: showsHtml,
+      }).catch(() => null);
+      if (!messages || (await client.getEmail()) !== email) return;
       for (const message of messages) {
         if (message.kind !== "message" || shown.current.has(message.id))
+          continue;
+        if (message.format === "html" && (!showsHtml || !message.html))
           continue;
         if (queue.current.some((queued) => queued.id === message.id)) continue;
         queue.current.push(message);
       }
       showNext();
     },
-    [refreshIntervalMs, showNext]
+    [clearMessages, refreshIntervalMs, showNext, showsHtml]
   );
 
   useEffect(() => {
@@ -112,10 +143,8 @@ export function SequenzyInAppHost({
     const removeListener = Sequenzy.addListener((event) => {
       if (event === "identified") void refresh(true);
       if (event === "reset") {
-        queue.current = [];
-        shown.current.clear();
-        visible.current = null;
-        setCurrent(null);
+        clearMessages();
+        owner.current = null;
       }
     });
     return () => {
@@ -123,10 +152,13 @@ export function SequenzyInAppHost({
       appState.remove();
       removeListener();
     };
-  }, [refresh, refreshIntervalMs]);
+  }, [clearMessages, refresh, refreshIntervalMs]);
 
   useEffect(() => {
-    if (current) void Sequenzy.report("displayed", current);
+    // Custom HTML reports displayed once its document has loaded.
+    if (current && current.format !== "html") {
+      void Sequenzy.report("displayed", current);
+    }
   }, [current]);
 
   if (!current) return null;
@@ -136,6 +168,66 @@ export function SequenzyInAppHost({
     setCurrent(null);
     showNext();
   };
+
+  const openUrl = (url: string, message: InAppMessage) => {
+    if (callbacks.current.onOpenUrl?.(url, message) !== true) {
+      void Linking.openURL(url).catch(() => undefined);
+    }
+  };
+
+  if (current.format === "html" && webView) {
+    const message = current;
+    const messageOwner = owner.current;
+    // The document acts for the contact it was fetched for: after identify
+    // as someone else its calls are dropped and it closes, unreported.
+    const forOwner = (action: () => void) => {
+      void (async () => {
+        if ((await Sequenzy.client?.getEmail()) !== messageOwner) {
+          if (visible.current?.id === message.id) close();
+          return;
+        }
+        action();
+      })();
+    };
+    return (
+      <InAppHtmlMessageView
+        key={message.id}
+        message={message}
+        webView={webView}
+        topInset={insets?.top ?? 0}
+        onLoaded={() =>
+          forOwner(() => void Sequenzy.report("displayed", message))
+        }
+        onBridge={(call) =>
+          forOwner(() => {
+            if (call.method === "logClick") {
+              void Sequenzy.report("clicked", message, call.buttonId);
+            } else if (call.method === "track") {
+              void Sequenzy.track(call.name, call.properties);
+            } else if (call.method === "setAttributes") {
+              void Sequenzy.setProfile({ attributes: call.attributes });
+            } else if (call.method === "setName") {
+              void Sequenzy.setProfile({
+                ...(call.firstName ? { firstName: call.firstName } : {}),
+                ...(call.lastName ? { lastName: call.lastName } : {}),
+              });
+            }
+          })
+        }
+        onFinish={(outcome) =>
+          forOwner(() => {
+            if (outcome.kind === "dismissed") {
+              void Sequenzy.report("dismissed", message);
+            } else if (outcome.kind === "opened") {
+              void Sequenzy.report("clicked", message, outcome.buttonId);
+              openUrl(outcome.url, message);
+            }
+            close();
+          })
+        }
+      />
+    );
+  }
 
   return (
     <InAppMessageView
@@ -154,9 +246,7 @@ export function SequenzyInAppHost({
           current.buttons.find((candidate) => candidate.action === "open_url")
             ?.url ??
           null;
-        if (url && callbacks.current.onOpenUrl?.(url, current) !== true) {
-          void Linking.openURL(url).catch(() => undefined);
-        }
+        if (url) openUrl(url, current);
         close();
       }}
     />
