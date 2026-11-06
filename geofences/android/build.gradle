@@ -1,0 +1,24 @@
+plugins {
+    id 'com.android.library'
+    id 'expo-module-gradle-plugin'
+}
+
+// Expo's module plugin publishes every module to a local Maven repository and
+// fails the whole app build without a versionName; use the npm version, which
+// the release writes into package.json.
+def packageVersion = new groovy.json.JsonSlurper().parse(file('../package.json')).version
+
+group = 'com.sequenzy.reactnative.geofences'
+version = packageVersion
+
+android {
+    namespace "com.sequenzy.reactnative.geofences"
+    defaultConfig {
+        versionCode 1
+        versionName packageVersion
+    }
+}
+
+dependencies {
+    implementation "com.google.android.gms:play-services-location:21.3.0"
+}

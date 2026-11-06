@@ -1,0 +1,51 @@
+{
+  "name": "@sequenzy/react-native-geofences",
+  "version": "0.2.0",
+  "description": "Geofencing for the Sequenzy React Native SDK: native region monitoring on iOS and Android reports when signed-in users enter or leave your places",
+  "keywords": [
+    "sequenzy",
+    "react-native",
+    "expo",
+    "geofencing",
+    "location",
+    "marketing-automation"
+  ],
+  "license": "MIT",
+  "homepage": "https://sequenzy.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sequenzy/sequenzy-react-native.git",
+    "directory": "geofences"
+  },
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "react-native": "src/index.ts",
+  "source": "src/index.ts",
+  "files": [
+    "lib",
+    "src",
+    "ios",
+    "android/build.gradle",
+    "android/src",
+    "expo-module.config.json",
+    "app.plugin.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test test"
+  },
+  "peerDependencies": {
+    "@sequenzy/react-native": ">=0.2.0",
+    "expo": ">=52",
+    "react-native": ">=0.76"
+  },
+  "devDependencies": {
+    "expo-modules-core": "3.0.29"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

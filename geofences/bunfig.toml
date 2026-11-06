@@ -1,0 +1,3 @@
+# Peers come from the app (and, here, from the SDK one folder up).
+[install]
+peer = false

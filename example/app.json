@@ -6,7 +6,7 @@
     "version": "1.0.0",
     "ios": { "bundleIdentifier": "com.sequenzy.example" },
     "android": { "package": "com.sequenzy.example" },
-    "plugins": ["expo-notifications"],
+    "plugins": ["expo-notifications", "@sequenzy/react-native-geofences"],
     "web": { "bundler": "metro" }
   }
 }

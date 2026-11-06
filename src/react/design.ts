@@ -129,7 +129,8 @@ export function splitButtons(buttons: InAppButton[]): {
   primary: InAppButton | null;
   secondary: InAppButton | null;
 } {
-  const index = buttons.findIndex((button) => button.action === "open_url");
+  // The first button that acts: opens a link or asks for push permission
+  const index = buttons.findIndex((button) => button.action !== "dismiss");
   const primaryIndex = index === -1 ? 0 : index;
   return {
     primary: buttons[primaryIndex] ?? null,

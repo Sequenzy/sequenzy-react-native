@@ -11,12 +11,22 @@ import {
   type FetchLike,
 } from "../src/client";
 import {
+  diffGeofenceRegions,
+  geofenceFetchLimit,
+  parseGeofenceRegion,
+  parseNearbyGeofences,
+  planGeofenceRegions,
+  roundCoordinate,
+} from "../src/geofences";
+import {
   IN_APP_HTML_MAX_CALLS_PER_DISPLAY,
   IN_APP_HTML_MAX_MESSAGE_BYTES,
   isAllowedInAppUrl,
   parseInAppHtmlBridgeMessage,
 } from "../src/html";
 import { parsePushPayload } from "../src/push";
+import { pushPermissionFromExpo } from "../src/push-permission";
+import type { PushPermissionStatus, SequenzyConfig } from "../src/types";
 import { createMemoryStorage } from "../src/storage";
 
 const fixtures = join(import.meta.dir, "../../contract/fixtures");
@@ -95,13 +105,17 @@ function createHarness() {
     return { status: 200, text: async () => '{"success":true}' };
   };
 
-  const make = (provider?: (email: string) => Promise<string>) =>
+  const make = (
+    provider?: (email: string) => Promise<string>,
+    extra: Partial<SequenzyConfig> = {}
+  ) =>
     new SequenzyClient(
       {
         ...contract.config,
         platform: "ios",
         storage,
         identityTokenProvider: provider,
+        ...extra,
         device: {
           appVersion: "1.0",
           osVersion: "18.0",
@@ -233,6 +247,7 @@ describe("SequenzyClient contract", () => {
     expect(messages.map((message) => message.id)).toEqual([
       "iam_modal",
       "iam_banner",
+      "iam_primer",
       "iam_card",
     ]);
     expect(messages[0]!.buttons[1]).toEqual({
@@ -833,6 +848,145 @@ describe("Live Activity tokens", () => {
   });
 });
 
+describe("push permission", () => {
+  let harness: ReturnType<typeof createHarness>;
+  beforeEach(() => {
+    harness = createHarness();
+  });
+
+  function handler(initial: PushPermissionStatus, afterRequest = initial) {
+    const state = { status: initial, requests: 0, settings: 0 };
+    return {
+      state,
+      pushPermission: {
+        getStatus: async () => state.status,
+        request: async () => {
+          state.requests += 1;
+          state.status = afterRequest;
+          return state.status;
+        },
+        openSettings: () => {
+          state.settings += 1;
+        },
+      },
+    };
+  }
+
+  it("sends the permission with registrations and registers again when it changes", async () => {
+    const { state, pushPermission } = handler("denied");
+    const client = harness.make(undefined, { pushPermission });
+    await client.identify(email, identityToken);
+    await client.setPushToken(token);
+    const registrations = () => harness.to("/api/v1/push/app-devices");
+    expectContract(registrations().at(-1), "registerDeviceWithPermission");
+
+    const count = registrations().length;
+    await client.registerPushIfNeeded();
+    expect(registrations()).toHaveLength(count);
+
+    state.status = "granted";
+    await client.registerPushIfNeeded();
+    expect(registrations()).toHaveLength(count + 1);
+    expect(registrations().at(-1)!.body["permission"]).toBe("granted");
+  });
+
+  it("registers without a permission when the handler is missing or fails", async () => {
+    const client = harness.make(undefined, {
+      pushPermission: {
+        getStatus: async () => {
+          throw new Error("no native module");
+        },
+        request: async () => "granted",
+      },
+    });
+    await client.setPushToken(token);
+    expectContract(
+      harness.to("/api/v1/push/app-devices").at(-1),
+      "registerAnonymousDevice"
+    );
+    expect(
+      harness.to("/api/v1/push/app-devices").at(-1)!.body["permission"]
+    ).toBeUndefined();
+  });
+
+  it("asks for push primers only when it can ask for permission", async () => {
+    harness.respondTo("/api/v1/in-app/feed", 200, { messages: [] });
+    const plain = harness.make();
+    await plain.identify(email, identityToken);
+    await plain.fetchFeed({ kind: "message" });
+    expectContract(harness.to("/api/v1/in-app/feed").at(-1), "fetchFeed");
+    expect(
+      harness.to("/api/v1/in-app/feed").at(-1)!.body["actions"]
+    ).toBeUndefined();
+
+    const able = harness.make(undefined, {
+      pushPermission: handler("not_determined").pushPermission,
+    });
+    await able.fetchFeed({ kind: "message" });
+    expectContract(
+      harness.to("/api/v1/in-app/feed").at(-1),
+      "fetchFeedWithPushPrimers"
+    );
+  });
+
+  it("reports a primer click with the permission", async () => {
+    const client = harness.make();
+    await client.identify(email, identityToken);
+    await client.report("clicked", "iam_primer", undefined, {
+      pushPermission: "granted",
+    });
+    expectContract(harness.requests.at(-1), "reportPushPrimerClicked");
+  });
+
+  it("prompts when the OS allows it and sends a second denial to Settings", async () => {
+    const opener = { calls: 0 };
+    const fallback = () => {
+      opener.calls += 1;
+    };
+    const fresh = handler("not_determined", "granted");
+    const asked = harness.make(undefined, {
+      pushPermission: fresh.pushPermission,
+    });
+    expect(await asked.requestPushPermission(fallback)).toBe("granted");
+    expect(fresh.state).toMatchObject({ requests: 1, settings: 0 });
+
+    const off = handler("denied");
+    const denied = harness.make(undefined, {
+      pushPermission: off.pushPermission,
+    });
+    expect(await denied.requestPushPermission(fallback)).toBe("denied");
+    expect(off.state).toMatchObject({ requests: 1, settings: 1 });
+    expect(opener.calls).toBe(0);
+
+    const allowed = handler("granted");
+    const done = harness.make(undefined, {
+      pushPermission: allowed.pushPermission,
+    });
+    expect(await done.requestPushPermission(fallback)).toBe("granted");
+    expect(allowed.state.requests).toBe(0);
+
+    expect(await harness.make().requestPushPermission(fallback)).toBeNull();
+  });
+
+  it("reads expo-notifications permissions", () => {
+    expect(pushPermissionFromExpo({ status: "granted", granted: true })).toBe(
+      "granted"
+    );
+    expect(pushPermissionFromExpo({ status: "denied", granted: false })).toBe(
+      "denied"
+    );
+    expect(pushPermissionFromExpo({ status: "undetermined" })).toBe(
+      "not_determined"
+    );
+    expect(
+      pushPermissionFromExpo({ status: "granted", ios: { status: 3 } })
+    ).toBe("provisional");
+    expect(
+      pushPermissionFromExpo({ status: "denied", ios: { status: 1 } })
+    ).toBe("denied");
+  });
+});
+
 describe("normalizeLiveActivityToken", () => {
   it("drops the activity id from push-to-start tokens and lowercases", () => {
     expect(
@@ -851,6 +1005,173 @@ describe("normalizeLiveActivityToken", () => {
 
   it("rejects corrupted stored entries", () => {
     expect(normalizeLiveActivityToken({ kind: "update" } as never)).toBeNull();
+  });
+});
+
+describe("Geofences", () => {
+  const geofences = (
+    JSON.parse(fixture("requests.json")) as {
+      geofences: {
+        nearbyResponse: Record<string, unknown>;
+        refreshRegionId: string;
+      };
+    }
+  ).geofences;
+  let harness: ReturnType<typeof createHarness>;
+  beforeEach(() => {
+    harness = createHarness();
+  });
+
+  it("fetches nearby geofences with a rounded position", async () => {
+    harness.respondTo(
+      "/api/v1/geofences/nearby",
+      200,
+      geofences.nearbyResponse
+    );
+    const client = harness.make();
+    await client.identify(email, identityToken);
+    const nearby = await client.fetchNearbyGeofences(
+      { latitude: 51.5074, longitude: -0.1404 },
+      geofenceFetchLimit(20)
+    );
+    expectContract(
+      harness.to("/api/v1/geofences/nearby").at(-1),
+      "fetchNearbyGeofences"
+    );
+    expect(nearby.geofences.map((region) => region.id)).toEqual([
+      "geo_1",
+      "geo_2",
+    ]);
+    expect(nearby.refreshRadiusMeters).toBe(4200);
+  });
+
+  it("requires identity for nearby geofences", async () => {
+    const client = harness.make();
+    await expect(
+      client.fetchNearbyGeofences({ latitude: 51.5, longitude: -0.1 }, 19)
+    ).rejects.toMatchObject({ code: "not_identified" });
+    expect(harness.to("/api/v1/geofences/nearby")).toHaveLength(0);
+  });
+
+  it("reports transitions through the queue, debounced, never the refresh region", async () => {
+    const client = harness.make();
+    await client.identify(email, identityToken);
+    expect(await client.trackGeofenceTransition("geo_1", "enter")).toBe(true);
+    const request = harness.to("/api/v1/app-events").at(-1)!;
+    expectContract(request, "trackGeofenceTransition");
+    const spec = contract.requests.find(
+      (entry) => entry.name === "trackGeofenceTransition"
+    )!;
+    const expected = (
+      spec.body["events"] as Array<Record<string, unknown>>
+    )[0]!;
+    expect(request.body["events"][0]).toMatchObject(expected);
+    expect(request.body["events"][0].occurredAt).toBe(
+      "2026-10-14T17:46:40.000Z"
+    );
+
+    harness.advance(30_000);
+    expect(await client.trackGeofenceTransition("geo_1", "enter")).toBe(false);
+    expect(await client.trackGeofenceTransition("geo_1", "exit")).toBe(true);
+    expect(
+      await client.trackGeofenceTransition(geofences.refreshRegionId, "exit")
+    ).toBe(false);
+    harness.advance(61_000);
+    expect(await client.trackGeofenceTransition("geo_1", "enter")).toBe(true);
+    expect(harness.to("/api/v1/app-events")).toHaveLength(3);
+  });
+
+  it("keeps queued geofence events across restarts and forgets the debounce on reset", async () => {
+    harness.respondTo("/api/v1/app-events", 503, { error: "down" }, 1);
+    const client = harness.make();
+    await client.identify(email, identityToken);
+    await client.trackGeofenceTransition("geo_2", "exit");
+    const restarted = harness.make();
+    await restarted.flush();
+    const event = harness.to("/api/v1/app-events").at(-1)!.body["events"][0];
+    expect(event).toMatchObject({
+      type: "geofence",
+      transition: "exit",
+      geofenceId: "geo_2",
+    });
+
+    await restarted.reset();
+    await restarted.identify(email, identityToken);
+    expect(await restarted.trackGeofenceTransition("geo_2", "exit")).toBe(true);
+  });
+
+  it("drops transitions while nobody is identified, so a later contact never gets them", async () => {
+    const client = harness.make();
+    expect(await client.trackGeofenceTransition("geo_1", "enter")).toBe(false);
+    await client.identify(email, identityToken);
+    await client.flush();
+    expect(harness.to("/api/v1/app-events")).toHaveLength(0);
+    expect(await client.trackGeofenceTransition("geo_1", "enter")).toBe(true);
+  });
+
+  it("does not debounce another contact by the previous one", async () => {
+    const client = harness.make();
+    await client.identify(email, identityToken);
+    expect(await client.trackGeofenceTransition("geo_1", "enter")).toBe(true);
+    await client.identify("sam@example.com", identityToken);
+    expect(await client.trackGeofenceTransition("geo_1", "enter")).toBe(true);
+  });
+
+  it("hands identity credentials to native reporters, asking the provider when told to", async () => {
+    let calls = 0;
+    const client = harness.make(async () => `seq_wid_fresh.${++calls}`);
+    expect(await client.identityCredentials()).toBeNull();
+    await client.identify(email, identityToken);
+    expect(await client.identityCredentials()).toEqual({
+      email,
+      identityToken,
+    });
+    expect(calls).toBe(0);
+    expect(await client.identityCredentials({ refresh: true })).toEqual({
+      email,
+      identityToken: "seq_wid_fresh.1",
+    });
+    await client.reset();
+    expect(await client.identityCredentials()).toBeNull();
+  });
+
+  it("plans the nearest geofences plus a refresh region and diffs changes", () => {
+    const nearby = parseNearbyGeofences(geofences.nearbyResponse);
+    const position = { latitude: 51.5074, longitude: -0.1404 };
+    const planned = planGeofenceRegions(nearby, position, 2);
+    expect(planned.map((region) => region.id)).toEqual([
+      "geo_1",
+      geofences.refreshRegionId,
+    ]);
+    expect(planned[1]).toEqual({
+      id: geofences.refreshRegionId,
+      ...position,
+      radiusMeters: 4200,
+    });
+    expect(
+      planGeofenceRegions(
+        { ...nearby, refreshRadiusMeters: null },
+        position,
+        20
+      ).map((region) => region.id)
+    ).toEqual(["geo_1", "geo_2"]);
+
+    const moved = { id: "geo_1", latitude: 1, longitude: 1, radiusMeters: 200 };
+    expect(diffGeofenceRegions(planned, [moved, planned[1]!])).toEqual({
+      remove: ["geo_1"],
+      add: [moved],
+    });
+    expect([
+      geofenceFetchLimit(20),
+      geofenceFetchLimit(1),
+      geofenceFetchLimit(500),
+    ]).toEqual([19, 1, 99]);
+    expect(roundCoordinate(-0.1404)).toBe(-0.14);
+    expect(parseGeofenceRegion({ id: "x" })).toBeNull();
+    expect(parseNearbyGeofences(null)).toEqual({
+      geofences: [],
+      refreshRadiusMeters: null,
+    });
   });
 });
 

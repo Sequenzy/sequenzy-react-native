@@ -7,7 +7,23 @@ export {
   type ClientDependencies,
   type FetchLike,
 } from "./client";
+export {
+  GEOFENCE_REFRESH_REGION_ID,
+  DEFAULT_MAX_REGIONS_IOS,
+  DEFAULT_MAX_REGIONS_ANDROID,
+  diffGeofenceRegions,
+  geofenceFetchLimit,
+  planGeofenceRegions,
+  roundCoordinate,
+  type GeofenceRegion,
+  type GeofenceTransition,
+  type NearbyGeofences,
+} from "./geofences";
 export { parsePushPayload } from "./push";
+export {
+  pushPermissionFromExpo,
+  type ExpoNotificationPermissions,
+} from "./push-permission";
 export { createMemoryStorage } from "./storage";
 export {
   SequenzyInAppHost,

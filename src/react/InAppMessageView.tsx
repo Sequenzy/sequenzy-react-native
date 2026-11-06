@@ -458,7 +458,7 @@ function Banner(props: InAppMessageViewProps) {
   const top = message.position === "top";
   const edge = top ? 8 + insets.top : 12 + insets.bottom;
   const { primary } = splitButtons(message.buttons);
-  const link = primary?.action === "open_url" ? primary : null;
+  const link = primary && primary.action !== "dismiss" ? primary : null;
   const direction = top ? -1 : 1;
 
   const offset = useRef(new Animated.Value(direction * 200)).current;

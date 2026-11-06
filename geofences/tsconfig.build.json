@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  // Built after the SDK one folder up (`bun run build` there), against its types.
+  "compilerOptions": {
+    "outDir": "lib",
+    "rootDir": "src",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "noEmit": false,
+    "paths": { "@sequenzy/react-native": ["../lib/index.d.ts"] }
+  },
+  "exclude": ["test"]
+}

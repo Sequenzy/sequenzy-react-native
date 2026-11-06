@@ -1,0 +1,10 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["SequenzyGeofencesModule"],
+    "appDelegateSubscribers": ["SequenzyGeofencesAppDelegateSubscriber"]
+  },
+  "android": {
+    "modules": ["com.sequenzy.reactnative.geofences.SequenzyGeofencesModule"]
+  }
+}

@@ -62,6 +62,9 @@ mock.module("react-native", () => ({
     openURL: async (url: string) => {
       opened.push(url);
     },
+    openSettings: async () => {
+      opened.push("app-settings:");
+    },
   },
   BackHandler: {
     addEventListener: (_event: string, listener: () => boolean) => {
@@ -110,7 +113,9 @@ interface Call {
 let calls: Call[] = [];
 let feedMessages: unknown[] = [];
 
-async function configure() {
+async function configure(
+  pushPermission?: Parameters<typeof Sequenzy.configure>[0]["pushPermission"]
+) {
   Sequenzy.unconfigure();
   Sequenzy.configure(
     {
@@ -120,6 +125,7 @@ async function configure() {
       platform: "ios",
       storage: createMemoryStorage(),
       logLevel: "none",
+      ...(pushPermission ? { pushPermission } : {}),
     },
     {
       fetch: async (url, init) => {
@@ -127,12 +133,17 @@ async function configure() {
         const body = JSON.parse(init.body);
         calls.push({ path, body });
         if (path === "/api/v1/in-app/feed") {
-          // Like the server: html items only for callers that list html.
+          // Like the API: html items only for callers that list html, push
+          // primers only for callers that list the action.
           const messages = feedMessages.filter(
             (message: any) =>
               (!body.kind || message.kind === body.kind) &&
               (message.format !== "html" ||
-                (body.formats ?? []).includes("html"))
+                (body.formats ?? []).includes("html")) &&
+              (body.actions?.includes("request_push_permission") ||
+                !(message.buttons ?? []).some(
+                  (button: any) => button.action === "request_push_permission"
+                ))
           );
           return {
             status: 200,
@@ -335,7 +346,11 @@ describe("cards", () => {
   it("opens the primary button and reports the click", async () => {
     let renderer!: ReturnType<typeof create>;
     await act(async () => {
-      renderer = create(<InAppCard card={feed.messages[2]} />);
+      renderer = create(
+        <InAppCard
+          card={feed.messages.find((item: any) => item.id === "iam_card")}
+        />
+      );
     });
     const button = renderer.root
       .findAllByType("Pressable" as never)
@@ -344,6 +359,125 @@ describe("cards", () => {
       await button!.props.onPress();
     });
     expect(reports("clicked")).toEqual(["iam_card"]);
+  });
+});
+
+describe("push primers", () => {
+  const primer = () =>
+    feed.messages.find((item: any) => item.id === "iam_primer");
+
+  function permissionHandler(statuses: string[]) {
+    const asked: string[] = [];
+    const settings: number[] = [];
+    let status = statuses[0]!;
+    return {
+      asked,
+      settings,
+      handler: {
+        getStatus: async () => status as any,
+        request: async () => {
+          asked.push(status);
+          status = statuses[1] ?? status;
+          return status as any;
+        },
+        openSettings: () => {
+          settings.push(1);
+        },
+      },
+    };
+  }
+
+  it("never shows a primer to an app that cannot ask for permission", async () => {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<SequenzyInAppHost />);
+    });
+    await settle();
+    const feedCall = calls.find((call) => call.path === "/api/v1/in-app/feed");
+    expect(feedCall?.body.actions).toBeUndefined();
+    expect(reports("displayed")).not.toContain("iam_primer");
+    await act(async () => renderer.unmount());
+  });
+
+  it("asks for permission from the primer and reports the result with the click", async () => {
+    const { handler, asked, settings } = permissionHandler([
+      "not_determined",
+      "granted",
+    ]);
+    await configure(handler);
+    feedMessages = [primer()];
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<SequenzyInAppHost />);
+    });
+    await settle();
+    const feedCall = calls.find((call) => call.path === "/api/v1/in-app/feed");
+    expect(feedCall?.body.actions).toEqual(["request_push_permission"]);
+    expect(reports("displayed")).toEqual(["iam_primer"]);
+
+    const button = renderer.root
+      .findAllByType("Pressable" as never)
+      .find((node) => textOf(node).includes("Turn on notifications"));
+    await act(async () => {
+      button!.props.onPress();
+    });
+    await settle();
+    expect(asked).toEqual(["not_determined"]);
+    expect(settings).toEqual([]);
+    expect(opened).toEqual([]);
+    const click = calls.find(
+      (call) =>
+        call.path === "/api/v1/in-app/feed/events" &&
+        call.body.type === "clicked"
+    );
+    expect(click?.body).toMatchObject({
+      messageId: "iam_primer",
+      pushPermission: "granted",
+    });
+    expect(
+      renderer.root.findAllByProps({ testID: "sequenzy-sheet" })
+    ).toHaveLength(0);
+    await act(async () => renderer.unmount());
+  });
+
+  it("opens the app's settings by default when the handler has no opener", async () => {
+    const { handler } = permissionHandler(["denied", "denied"]);
+    const { openSettings: _unused, ...withoutOpener } = handler;
+    await configure(withoutOpener);
+    expect(await Sequenzy.requestPushPermission()).toBe("denied");
+    expect(opened).toEqual(["app-settings:"]);
+  });
+
+  it("opens notification settings when the contact turned them off", async () => {
+    const { handler, settings } = permissionHandler(["denied", "denied"]);
+    await configure(handler);
+    await Sequenzy.handleButtonPress(primer().buttons[0], primer());
+    expect(settings).toEqual([1]);
+    const click = calls.find(
+      (call) => call.path === "/api/v1/in-app/feed/events"
+    );
+    expect(click?.body).toMatchObject({
+      type: "clicked",
+      pushPermission: "denied",
+    });
+  });
+
+  it("makes the permission button primary and the dismiss button plain text", async () => {
+    await configure(permissionHandler(["not_determined"]).handler);
+    feedMessages = [primer()];
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<SequenzyInAppHost />);
+    });
+    await settle();
+    const labels = renderer.root
+      .findAllByType("Pressable" as never)
+      .map((node) => textOf(node))
+      .filter((text) => text !== "");
+    expect(labels.indexOf("Turn on notifications")).toBeLessThan(
+      labels.indexOf("Not now")
+    );
+    await act(async () => renderer.unmount());
   });
 });
 

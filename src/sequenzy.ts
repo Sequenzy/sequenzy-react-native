@@ -1,8 +1,16 @@
+import { Linking } from "react-native";
+
 import {
   SequenzyClient,
   SequenzyError,
   type ClientDependencies,
 } from "./client";
+import {
+  DEFAULT_MAX_REGIONS_IOS,
+  geofenceFetchLimit,
+  type GeofenceTransition,
+  type NearbyGeofences,
+} from "./geofences";
 import { parsePushPayload } from "./push";
 import type {
   CommerceCart,
@@ -17,6 +25,7 @@ import type {
   InAppEventType,
   InAppMessage,
   LiveActivityToken,
+  PushPermissionStatus,
   SequenzyConfig,
 } from "./types";
 
@@ -25,6 +34,8 @@ type Listener = (event: "identified" | "reset") => void;
 let client: SequenzyClient | null = null;
 const listeners = new Set<Listener>();
 let openUrl: (url: string) => Promise<unknown> | unknown = () => undefined;
+const openAppSettings = () => Linking.openSettings().catch(() => undefined);
+let openSettings: () => Promise<unknown> | unknown = openAppSettings;
 
 function requireClient(): SequenzyClient {
   if (!client) {
@@ -62,6 +73,7 @@ export const Sequenzy = {
   unconfigure(): void {
     client = null;
     listeners.clear();
+    openSettings = openAppSettings;
   },
 
   get client(): SequenzyClient | null {
@@ -71,6 +83,23 @@ export const Sequenzy = {
   /** How the SDK opens URLs; the React layer sets this to `Linking.openURL`. */
   setUrlOpener(opener: (url: string) => Promise<unknown> | unknown): void {
     openUrl = opener;
+  },
+
+  /**
+   * How the SDK opens the app's settings when `pushPermission.openSettings`
+   * is not set. Defaults to `Linking.openSettings()`.
+   */
+  setSettingsOpener(opener: () => Promise<unknown> | unknown): void {
+    openSettings = opener;
+  },
+
+  /**
+   * Asks for notification permission (needs `pushPermission` in configure):
+   * the system prompt when the OS still shows one, otherwise the app's
+   * notification settings. Returns the permission afterwards.
+   */
+  requestPushPermission(): Promise<PushPermissionStatus | null> {
+    return requireClient().requestPushPermission(openSettings);
   },
 
   /**
@@ -188,6 +217,24 @@ export const Sequenzy = {
     return true;
   },
 
+  /** The nearest active geofences around a position. Usually called by
+   * `@sequenzy/react-native-geofences` rather than the app. */
+  fetchNearbyGeofences(
+    position: { latitude: number; longitude: number },
+    limit = geofenceFetchLimit(DEFAULT_MAX_REGIONS_IOS)
+  ): Promise<NearbyGeofences> {
+    return requireClient().fetchNearbyGeofences(position, limit);
+  },
+
+  /** Reports an enter or exit your own region monitoring saw. */
+  trackGeofenceTransition(
+    geofenceId: string,
+    transition: GeofenceTransition,
+    at?: Date
+  ): Promise<boolean> {
+    return requireClient().trackGeofenceTransition(geofenceId, transition, at);
+  },
+
   /**
    * Open in-app messages, for apps that present them themselves. Custom HTML
    * messages are included only with `includeHtml`.
@@ -218,16 +265,27 @@ export const Sequenzy = {
     return requireClient().report(type, message.id, buttonId);
   },
 
-  /** Reports the click and opens the button's URL. */
+  /**
+   * Reports the click and performs the button's action: opens its URL, or
+   * asks for push permission and reports the result with the click.
+   */
   async handleButtonPress(
     button: InAppButton,
     message: Pick<InAppMessage, "id">
   ): Promise<void> {
+    const current = requireClient();
     if (button.action === "dismiss") {
-      await requireClient().report("dismissed", message.id);
+      await current.report("dismissed", message.id);
       return;
     }
-    await requireClient().report("clicked", message.id);
+    if (button.action === "request_push_permission") {
+      const pushPermission = await current.requestPushPermission(openSettings);
+      await current.report("clicked", message.id, undefined, {
+        pushPermission,
+      });
+      return;
+    }
+    await current.report("clicked", message.id);
     if (button.url) await openUrl(button.url);
   },
 

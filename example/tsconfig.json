@@ -2,6 +2,9 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true,
-    "paths": { "@sequenzy/react-native": ["../src/index.ts"] }
+    "paths": {
+      "@sequenzy/react-native": ["../src/index.ts"],
+      "@sequenzy/react-native-geofences": ["../geofences/src/index.ts"]
+    }
   }
 }

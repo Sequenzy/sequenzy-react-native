@@ -1,3 +1,11 @@
+import {
+  GEOFENCE_DEBOUNCE_MS,
+  GEOFENCE_REFRESH_REGION_ID,
+  parseNearbyGeofences,
+  roundCoordinate,
+  type GeofenceTransition,
+  type NearbyGeofences,
+} from "./geofences";
 import { isValidInAppButtonId } from "./html";
 import { defaultStorage, prefixedStorage } from "./storage";
 import type {
@@ -15,12 +23,14 @@ import type {
   LogLevel,
   ProfileUpdate,
   PushPayload,
+  PushPermissionHandler,
+  PushPermissionStatus,
   SequenzyConfig,
   SubscribeInput,
   SubscribeResult,
 } from "./types";
 
-export const SDK_VERSION = "0.1.1";
+export const SDK_VERSION = "0.2.0";
 export const DEFAULT_API_BASE_URL = "https://api.sequenzy.com";
 export const MAX_QUEUED_EVENTS = 100;
 export const MAX_BATCH_SIZE = 20;
@@ -32,6 +42,22 @@ export const MAX_PROPERTIES_BYTES = 8 * 1024;
 export const PROVIDER_RETRY_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 20_000;
 const APNS_TOKEN_PATTERN = /^[0-9a-fA-F]{64,200}$/;
+const PUSH_PERMISSION_STATUSES: readonly PushPermissionStatus[] = [
+  "granted",
+  "provisional",
+  "ephemeral",
+  "denied",
+  "not_determined",
+];
+/** Button actions this SDK handles beyond open_url and dismiss. */
+export const PUSH_PERMISSION_ACTION = "request_push_permission";
+
+function isPushPermissionStatus(value: unknown): value is PushPermissionStatus {
+  return (
+    typeof value === "string" &&
+    (PUSH_PERMISSION_STATUSES as readonly string[]).includes(value)
+  );
+}
 
 /** UTF-8 byte length without TextEncoder, which RN before 0.74 lacks. */
 function utf8Length(value: string): number {
@@ -81,6 +107,7 @@ const KEYS = {
   pushRegistration: "pushRegistration",
   profile: "profile",
   liveActivityTokens: "liveActivityTokens",
+  geofenceTransitions: "geofenceTransitions",
 } as const;
 
 /** Stored ActivityKit tokens; the newest are kept. */
@@ -129,7 +156,7 @@ function replacesLiveActivityToken(
   return next.kind === "push_to_start" || next.activityId === stored.activityId;
 }
 
-type QueuedEventType = "screen" | "commerce";
+type QueuedEventType = "screen" | "commerce" | "geofence";
 
 interface QueuedEvent {
   /** Absent for custom events (and events queued by older SDK versions). */
@@ -138,6 +165,9 @@ interface QueuedEvent {
   eventId: string;
   properties: EventProperties;
   occurredAt: string;
+  /** `enter` or `exit`, for geofence events. */
+  transition?: GeofenceTransition;
+  geofenceId?: string;
 }
 
 interface HttpResponse {
@@ -218,6 +248,7 @@ export class SequenzyClient {
   identityTokenProvider: ((email: string) => Promise<string>) | undefined;
   device: DeviceInfo;
   logLevel: LogLevel;
+  pushPermission: PushPermissionHandler | undefined;
 
   private readonly storage: KeyValueStorage;
   private readonly fetchImpl: FetchLike;
@@ -244,6 +275,8 @@ export class SequenzyClient {
       token: string;
       email: string;
       registeredAt: number;
+      /** Permission sent with this registration; absent when unknown. */
+      permission?: PushPermissionStatus;
     } | null;
     liveActivityTokens: LiveActivityToken[];
   } = {
@@ -273,6 +306,7 @@ export class SequenzyClient {
       ),
     };
     this.identityTokenProvider = config.identityTokenProvider;
+    this.pushPermission = config.pushPermission;
     this.device = config.device ?? {};
     this.logLevel = config.logLevel ?? "error";
     this.logImpl =
@@ -405,6 +439,8 @@ export class SequenzyClient {
         this.state.identityToken = null;
         await this.save("email", normalized);
         await this.save("identityToken", null);
+        // Another contact's recent geofence transitions must not suppress this one's.
+        await this.save("geofenceTransitions", null);
       }
       if (identityToken) {
         this.state.identityToken = identityToken;
@@ -477,6 +513,7 @@ export class SequenzyClient {
         this.save("email", null),
         this.save("identityToken", null),
         this.save("pushRegistration", null),
+        this.save("geofenceTransitions", null),
         this.save("anonymousId", this.state.anonymousId),
         this.persistLiveActivityTokens(),
         this.persistEvents(),
@@ -866,16 +903,30 @@ export class SequenzyClient {
     return this.run(() => this.registerPushLocked(force));
   }
 
+  /** The permission from `pushPermission.getStatus()`; null when unknown. */
+  private async readPushPermission(): Promise<PushPermissionStatus | null> {
+    if (!this.pushPermission) return null;
+    try {
+      const status = await this.pushPermission.getStatus();
+      return isPushPermissionStatus(status) ? status : null;
+    } catch (error) {
+      this.log("info", `Could not read push permission: ${String(error)}`);
+      return null;
+    }
+  }
+
   private async registerPushLocked(force: boolean): Promise<void> {
     const token = this.state.pushToken;
     if (!token || this.config.platform === "web") return;
     const identity = this.state.email ?? "";
+    const permission = await this.readPushPermission();
     const last = this.state.pushRegistration;
     if (
       !force &&
       last &&
       last.token === token &&
       last.email === identity &&
+      (permission === null || last.permission === permission) &&
       this.now() - last.registeredAt < PUSH_REFRESH_INTERVAL_MS
     ) {
       return;
@@ -887,6 +938,7 @@ export class SequenzyClient {
       platform: this.config.platform,
       token,
       anonymousId: await this.ensureAnonymousId(),
+      ...(permission ? { permission } : {}),
     };
     for (const key of [
       "appVersion",
@@ -936,6 +988,7 @@ export class SequenzyClient {
       token,
       email: identified ? identity : "",
       registeredAt: this.now(),
+      ...(permission ? { permission } : {}),
     };
     await this.save(
       "pushRegistration",
@@ -1112,6 +1165,41 @@ export class SequenzyClient {
     }
   }
 
+  /**
+   * Asks for notification permission the way a push primer does: the
+   * system prompt when the OS still shows one, otherwise (the contact
+   * turned notifications off) the app's notification settings. Runs outside
+   * the serialized queue, since the prompt waits for the user. Returns the
+   * permission afterwards, or null without a `pushPermission` handler.
+   */
+  async requestPushPermission(
+    openSettings: () => Promise<unknown> | unknown
+  ): Promise<PushPermissionStatus | null> {
+    const handler = this.pushPermission;
+    if (!handler) {
+      this.log(
+        "error",
+        "Pass pushPermission to configure() to ask for notification permission"
+      );
+      return null;
+    }
+    try {
+      const before = await handler.getStatus();
+      if (before === "granted" || before === "ephemeral") return before;
+      const after = await handler.request();
+      // iOS answers a second request without a prompt, and Android stops
+      // prompting after repeated denials: send them to Settings instead.
+      if (before === "denied" && after === "denied") {
+        await (handler.openSettings ?? openSettings)();
+      }
+      await this.registerPushIfNeeded();
+      return isPushPermissionStatus(after) ? after : null;
+    } catch (error) {
+      this.log("error", `Push permission request failed: ${String(error)}`);
+      return null;
+    }
+  }
+
   // endregion
 
   // region In-app
@@ -1138,6 +1226,8 @@ export class SequenzyClient {
           ...(options.kind ? { kind: options.kind } : {}),
           ...(options.limit ? { limit: options.limit } : {}),
           ...(options.formats ? { formats: options.formats } : {}),
+          // Push primers come only when this app can ask for permission
+          ...(this.pushPermission ? { actions: [PUSH_PERMISSION_ACTION] } : {}),
         })
       );
       if (result.kind === "not_identified")
@@ -1164,14 +1254,132 @@ export class SequenzyClient {
     });
   }
 
+  // region Geofences
+
+  /** The nearest active geofences around a position, rounded to two
+   * decimals here whatever the caller passes. */
+  fetchNearbyGeofences(
+    position: { latitude: number; longitude: number },
+    limit: number
+  ): Promise<NearbyGeofences> {
+    return this.run(async () => {
+      const result = await this.withIdentity((email, identityToken) =>
+        this.post("/api/v1/geofences/nearby", {
+          companyId: this.config.companyId,
+          publicKey: this.config.publicKey,
+          email,
+          identityToken,
+          latitude: roundCoordinate(position.latitude),
+          longitude: roundCoordinate(position.longitude),
+          limit: Math.max(1, Math.min(99, Math.floor(limit))),
+        })
+      );
+      if (result.kind === "not_identified")
+        throw new SequenzyError(
+          "Call identify(email, identityToken) first",
+          "not_identified"
+        );
+      if (result.kind === "rejected")
+        throw new SequenzyError(
+          "The identity token was rejected",
+          "identity_rejected"
+        );
+      if (result.kind === "failed") throw result.error;
+      const { status, body } = result.response;
+      if (status < 200 || status >= 300) {
+        throw new SequenzyError(
+          `HTTP ${status} ${errorMessage(body)}`.trim(),
+          "http",
+          status
+        );
+      }
+      return parseNearbyGeofences(body);
+    });
+  }
+
+  /** Queues an enter or exit the OS reported for the identified contact.
+   * The refresh region, a repeat of the same transition within a minute and
+   * any transition while nobody is identified are ignored. Resolves whether
+   * it was queued. */
+  trackGeofenceTransition(
+    geofenceId: string,
+    transition: GeofenceTransition,
+    at?: Date
+  ): Promise<boolean> {
+    return this.run(async () => {
+      const id = geofenceId.trim();
+      if (!id || id === GEOFENCE_REFRESH_REGION_ID) return false;
+      if (transition !== "enter" && transition !== "exit") return false;
+      // Visits belong to a contact; never queue one for whoever signs in next.
+      if (!this.state.email) return false;
+      const occurredAt = at ? at.getTime() : this.now();
+      const stored =
+        safeParse<Record<string, number>>(
+          await this.storage.getItem(KEYS.geofenceTransitions)
+        ) ?? {};
+      const key = `${id}:${transition}`;
+      const last = stored[key];
+      if (
+        typeof last === "number" &&
+        Math.abs(occurredAt - last) < GEOFENCE_DEBOUNCE_MS
+      ) {
+        this.log("debug", `Ignored repeated geofence ${transition} for ${id}`);
+        return false;
+      }
+      const cutoff = this.now() - MAX_EVENT_AGE_MS;
+      const recent: Record<string, number> = {};
+      for (const [entry, value] of Object.entries(stored)) {
+        if (typeof value === "number" && value > cutoff) recent[entry] = value;
+      }
+      recent[key] = occurredAt;
+      await this.save("geofenceTransitions", JSON.stringify(recent));
+      this.events.push({
+        type: "geofence",
+        name: "geofence",
+        eventId: this.uuid(),
+        properties: {},
+        occurredAt: new Date(occurredAt).toISOString(),
+        transition,
+        geofenceId: id,
+      });
+      if (this.events.length > MAX_QUEUED_EVENTS) {
+        this.events.splice(0, this.events.length - MAX_QUEUED_EVENTS);
+      }
+      await this.persistEvents();
+      await this.flushLocked();
+      return true;
+    });
+  }
+
+  /** The signed-in email and its identity token, for native code that
+   * reports while JavaScript is not running (the geofence module). Asks the
+   * identity token provider when no token is stored or `refresh` is set. */
+  identityCredentials(
+    options: { refresh?: boolean } = {}
+  ): Promise<{ email: string; identityToken: string } | null> {
+    return this.run(async () => {
+      const email = this.state.email;
+      if (!email) return null;
+      let token = this.state.identityToken;
+      if (!token || options.refresh) {
+        token = (await this.tokenFromProvider(email)) ?? token;
+      }
+      return token ? { email, identityToken: token } : null;
+    });
+  }
+
+  // endregion
+
   /**
    * Reports `displayed`, `clicked`, `dismissed` or `read` for a feed item.
-   * `buttonId` names the control clicked in a custom HTML message.
+   * `buttonId` names the control clicked in a custom HTML message. A push
+   * primer's click carries the permission the app read after asking.
    */
   report(
     type: InAppEventType,
     messageId: string,
-    buttonId?: string
+    buttonId?: string,
+    options: { pushPermission?: PushPermissionStatus | null } = {}
   ): Promise<boolean> {
     return this.run(async () => {
       const result = await this.withIdentity((email, identityToken) =>
@@ -1184,6 +1392,9 @@ export class SequenzyClient {
           type,
           ...(buttonId && type === "clicked" && isValidInAppButtonId(buttonId)
             ? { buttonId }
+            : {}),
+          ...(options.pushPermission
+            ? { pushPermission: options.pushPermission }
             : {}),
         })
       );

@@ -18,12 +18,19 @@ Without AsyncStorage the SDK keeps its state in memory and logs a warning.
 ## Use
 
 ```tsx
-import { InAppCard, Sequenzy, SequenzyInAppHost, useInAppCards } from "@sequenzy/react-native";
+import { InAppCard, pushPermissionFromExpo, Sequenzy, SequenzyInAppHost, useInAppCards } from "@sequenzy/react-native";
+import * as Notifications from "expo-notifications";
 import * as Application from "expo-application";
 import { Platform } from "react-native";
 
 Sequenzy.configure({
   publicKey: "seq_pk_...", // key with your app IDs under Allowed app IDs
+  // Optional: lets Sequenzy see who allows notifications and show push
+  // primers (in-app messages that ask). With expo-notifications:
+  pushPermission: {
+    getStatus: async () => pushPermissionFromExpo(await Notifications.getPermissionsAsync()),
+    request: async () => pushPermissionFromExpo(await Notifications.requestPermissionsAsync()),
+  },
   companyId: "your-company-id",
   appId: Application.applicationId!,
   platform: Platform.OS === "ios" ? "ios" : "android",
@@ -69,6 +76,22 @@ On sign-out, end your running activities in native code before
 `SequenzyInAppHost` takes `shouldShow`, `onOpenUrl`, `refreshIntervalMs` and
 `fonts` (map brand font names to fonts your app bundles; on the web the CSS
 stack is used as is).
+
+## Geofencing
+
+[`@sequenzy/react-native-geofences`](./geofences), an Expo module, watches
+your [geofences](https://docs.sequenzy.com/concepts/geofences) natively on iOS
+and Android and reports visits of the signed-in contact, also while the app is
+not running:
+
+```ts
+await SequenzyGeofences.start(); // after Sequenzy.configure
+await SequenzyGeofences.requestAuthorization();
+await SequenzyGeofences.enable();
+```
+
+Apps that monitor regions themselves call `Sequenzy.fetchNearbyGeofences` and
+`Sequenzy.trackGeofenceTransition` instead.
 
 ## Custom HTML messages
 

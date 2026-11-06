@@ -240,9 +240,19 @@ export function SequenzyInAppHost({
         close();
       }}
       onPress={(button: InAppButton | null) => {
+        // A banner tap (null) acts like its primary button
+        const target =
+          button ??
+          current.buttons.find((candidate) => candidate.action !== "dismiss") ??
+          null;
+        if (target?.action === "request_push_permission") {
+          void Sequenzy.handleButtonPress(target, current);
+          close();
+          return;
+        }
         void Sequenzy.report("clicked", current);
         const url =
-          button?.url ??
+          target?.url ??
           current.buttons.find((candidate) => candidate.action === "open_url")
             ?.url ??
           null;

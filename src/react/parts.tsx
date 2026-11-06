@@ -259,7 +259,7 @@ export function ButtonStack({
               {
                 fontFamily: font,
                 color:
-                  secondary.action === "open_url"
+                  secondary.action !== "dismiss"
                     ? palette.secondaryLink
                     : palette.secondaryDismiss,
               },

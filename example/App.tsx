@@ -4,6 +4,7 @@ import {
   SequenzyInAppHost,
   useInAppCards,
 } from "@sequenzy/react-native";
+import { SequenzyGeofences } from "@sequenzy/react-native-geofences";
 import * as Application from "expo-application";
 import * as Notifications from "expo-notifications";
 import { StatusBar } from "expo-status-bar";
@@ -50,6 +51,9 @@ Sequenzy.configure({
     return identityToken;
   },
 });
+
+// Geofencing is native only.
+if (Platform.OS !== "web") void SequenzyGeofences.start();
 
 async function registerForPush() {
   if (Platform.OS === "web") return;
@@ -131,6 +135,21 @@ export default function App() {
                 setStatus("Updated the profile");
               }}
             />
+            {Platform.OS !== "web" ? (
+              <Button
+                label="Turn on geofencing"
+                secondary
+                onPress={async () => {
+                  const authorization =
+                    await SequenzyGeofences.requestAuthorization();
+                  await SequenzyGeofences.enable();
+                  const { regionIds } = await SequenzyGeofences.status();
+                  setStatus(
+                    `Location: ${authorization}, watching ${regionIds.length} regions`
+                  );
+                }}
+              />
+            ) : null}
             <Button
               label="Sign out"
               secondary

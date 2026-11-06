@@ -36,9 +36,37 @@ export type InAppFormat = "modal" | "banner" | "fullscreen" | "html";
 
 export interface InAppButton {
   label: string;
-  action: "open_url" | "dismiss";
-  /** Null for dismiss buttons. */
+  /**
+   * `request_push_permission` (a push primer) asks for notification
+   * permission; feeds include it only when `pushPermission` is configured.
+   */
+  action: "open_url" | "dismiss" | "request_push_permission";
+  /** Null unless the button opens a link. */
   url: string | null;
+}
+
+/**
+ * The OS notification permission. `provisional` (iOS) delivers quietly to
+ * Notification Center; `ephemeral` is an App Clip's temporary permission.
+ */
+export type PushPermissionStatus =
+  "granted" | "provisional" | "ephemeral" | "denied" | "not_determined";
+
+/**
+ * How the SDK reads and asks for notification permission. React Native has
+ * no built-in API for it, so pass your notifications library's calls, for
+ * example expo-notifications through `pushPermissionFromExpo`.
+ */
+export interface PushPermissionHandler {
+  /** The current permission, without prompting. */
+  getStatus(): Promise<PushPermissionStatus>;
+  /** Shows the system prompt (when the OS still allows it) and returns the result. */
+  request(): Promise<PushPermissionStatus>;
+  /**
+   * Opens the app's notification settings, for contacts who turned
+   * notifications off. Defaults to `Linking.openSettings()`.
+   */
+  openSettings?(): Promise<unknown> | unknown;
 }
 
 /** Resolved colors (`#rrggbb`), radii and the brand font stack. */
@@ -178,6 +206,13 @@ export interface SequenzyConfig {
   storage?: KeyValueStorage;
   device?: DeviceInfo;
   logLevel?: LogLevel;
+  /**
+   * Reads and requests notification permission. With it the SDK reports
+   * each device's permission (for your opt-in rate and the contact's
+   * `pushPermission` attribute) and shows push primers: in-app messages
+   * whose button asks for permission.
+   */
+  pushPermission?: PushPermissionHandler;
 }
 
 /** AsyncStorage-compatible persistence. */

@@ -11,6 +11,7 @@
   "dependencies": {
     "@expo/metro-runtime": "~6.1.2",
     "@react-native-async-storage/async-storage": "2.2.0",
+    "@sequenzy/react-native-geofences": "file:../geofences",
     "expo": "~54.0.0",
     "expo-application": "~7.0.7",
     "expo-notifications": "~0.32.12",
