@@ -1,7 +1,8 @@
 /** An item in the contact's in-app feed. Mirrors `InAppMessageView` on the server. */
 export interface InAppMessage {
   id: string;
-  kind: "message" | "card";
+  /** `placement`: shown inline by `SequenzyPlacement`, never in the feed. */
+  kind: "message" | "card" | "placement";
   /** `html`: a custom HTML message, shown by `SequenzyInAppHost` with a `webView`. */
   format: InAppFormat | null;
   /** Banners: top or bottom. Modals: bottom (a sheet) or center. */
@@ -17,6 +18,10 @@ export interface InAppMessage {
   data: Record<string, string>;
   style: InAppStyle;
   pinned: boolean;
+  /** Placement items: the placement key they fill. */
+  placement?: string | null;
+  /** Placement items: how the item is drawn; missing or unknown = card. */
+  layout?: "card" | "banner" | "hero" | null;
   sequenceId?: string | null;
   stepId?: string | null;
   createdAt: string;
@@ -167,7 +172,8 @@ export interface PushPayload {
  * An ActivityKit push token from your app's native Live Activity code (iOS).
  * `push_to_start` tokens (iOS 17.2+, one per ActivityAttributes type) let
  * your backend start activities; `update` tokens (one per running activity)
- * let it update and end them.
+ * let it update and end them. On Android the SDK generates these tokens
+ * for Live Updates (`observeLiveUpdates`, `handleLiveUpdate`).
  */
 export interface LiveActivityToken {
   kind: "push_to_start" | "update";
@@ -179,6 +185,25 @@ export interface LiveActivityToken {
   token: string;
 }
 
+/** An Android Live Update the app starts itself (`startLiveUpdate`). */
+export interface LiveUpdateActivityInput {
+  /** The same name as your iOS ActivityAttributes type, e.g. "DeliveryAttributes". */
+  activityType: string;
+  /** The id your backend updates and ends it with, e.g. "order-1234". */
+  activityId: string;
+  attributes?: Record<string, unknown>;
+  contentState?: Record<string, unknown>;
+  staleDateMs?: number | null;
+}
+
+export type {
+  LiveUpdateActivity,
+  LiveUpdateAlert,
+  LiveUpdateDecision,
+  LiveUpdateEvent,
+  LiveUpdatePayload,
+} from "./live-updates";
+
 export type LogLevel = "none" | "error" | "info" | "debug";
 
 export interface DeviceInfo {
@@ -186,8 +211,17 @@ export interface DeviceInfo {
   osVersion?: string | null;
   deviceName?: string | null;
   locale?: string | null;
+  /**
+   * IANA timezone, used to deliver push campaigns in the contact's local
+   * time. Defaults to the zone `Intl` reports; pass null to not send one.
+   */
   timezone?: string | null;
 }
+
+export type UserIdentityTokenProvider = (identity: {
+  externalId: string;
+  email: string | null;
+}) => Promise<string>;
 
 export interface SequenzyConfig {
   /** Publishable key (`seq_pk_...`) restricted to your app IDs. */
@@ -203,6 +237,11 @@ export interface SequenzyConfig {
   apiBaseUrl?: string;
   /** Asks your backend for a fresh identity token for `email`. */
   identityTokenProvider?: (email: string) => Promise<string>;
+  /**
+   * Asks your backend for a fresh identity token for a user identified with
+   * `identifyUser`: mint it for `externalId`, plus `email` when it is set.
+   */
+  userIdentityTokenProvider?: UserIdentityTokenProvider;
   storage?: KeyValueStorage;
   device?: DeviceInfo;
   logLevel?: LogLevel;
@@ -213,6 +252,12 @@ export interface SequenzyConfig {
    * whose button asks for permission.
    */
   pushPermission?: PushPermissionHandler;
+  /**
+   * Android Live Updates: called with the activity ids whose notifications
+   * to remove, after `reset()` or when another person signs in. Cancel
+   * them in your notification library.
+   */
+  onLiveUpdatesRemoved?: (activityIds: string[]) => void;
 }
 
 /** AsyncStorage-compatible persistence. */

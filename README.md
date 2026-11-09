@@ -47,6 +47,7 @@ export default function App() {
 }
 
 await Sequenzy.identify(user.email); // after sign-in; resolves false for an invalid email
+await Sequenzy.identifyUser(user.id); // or by your user ID, for users without an email
 Sequenzy.track("workout_completed", { minutes: 30 });
 // The native token: Expo getDevicePushTokenAsync(), or with React Native
 // Firebase messaging().getAPNSToken() on iOS and getToken() on Android.
@@ -73,9 +74,48 @@ await Sequenzy.liveActivityEnded(token); // when the activity ends or is dismiss
 On sign-out, end your running activities in native code before
 `Sequenzy.reset()`, so the next person never sees them.
 
+Android Live Updates take the same backend calls. The SDK keeps their state
+and tokens; your notification library (for example Notifee) draws them:
+
+```ts
+await Sequenzy.observeLiveUpdates("DeliveryAttributes"); // at launch, on Android
+// in messaging().onMessage and setBackgroundMessageHandler:
+// canShow: false when notifications are off or you don't draw this type
+const decision = await Sequenzy.handleLiveUpdate(remoteMessage.data, { canShow: true });
+if (decision?.action === "show") {
+  // post or update the notification for decision.activity.activityId:
+  // ongoing until decision.activity.isEnded, removed at decision.dismissAtMs
+}
+await Sequenzy.liveUpdateDismissed(activityId); // Notifee's DISMISSED event
+```
+
+`startLiveUpdate`, `updateLiveUpdate` and `endLiveUpdate` change one from the
+app, and `onLiveUpdatesRemoved` in the config lists the notifications to
+cancel after sign-out. On Hermes, install `react-native-get-random-values` so
+Live Update tokens come from a secure random source.
+
+Device registrations report the timezone `Intl` gives, so push campaigns can
+deliver in each contact's local time. Pass `device: { timezone }` to override
+it, or `timezone: null` to send none.
+
 `SequenzyInAppHost` takes `shouldShow`, `onOpenUrl`, `refreshIntervalMs` and
 `fonts` (map brand font names to fonts your app bundles; on the web the CSS
 stack is used as is).
+
+## Placements
+
+Show in-app content inline, in a slot of your own layout, for a
+[placement](https://docs.sequenzy.com/concepts/in-app-placements) defined in Sequenzy. Nothing renders while
+the contact has nothing to show, so the slot collapses.
+
+```tsx
+import { SequenzyPlacement, usePlacement } from "@sequenzy/react-native";
+
+<SequenzyPlacement placementId="home_hero" />
+
+// Or draw it yourself:
+const { item, logDisplayed, dismiss } = usePlacement("home_hero");
+```
 
 ## Geofencing
 
@@ -127,3 +167,11 @@ sources with every release.
   and [in-app messages](https://docs.sequenzy.com/concepts/in-app-messages)
 - [Pricing](https://sequenzy.com/pricing)
 - Other Sequenzy SDKs: [iOS](https://github.com/Sequenzy/sequenzy-swift), [Android](https://github.com/Sequenzy/sequenzy-android), [Flutter](https://github.com/Sequenzy/sequenzy-flutter)
+
+## Users without an email
+
+For users who sign in without an email (a hidden Apple address, phone login),
+mint the identity token for your user ID as `externalId` and call
+`identifyUser` with the same ID (and the email, when you minted with it). Set
+`userIdentityTokenProvider` to renew these tokens. See
+[Users without an email](https://docs.sequenzy.com/concepts/mobile-sdks#users-without-an-email).

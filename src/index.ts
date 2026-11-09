@@ -21,6 +21,12 @@ export {
 } from "./geofences";
 export { parsePushPayload } from "./push";
 export {
+  LIVE_UPDATE_ENDED_LINGER_MS,
+  isLiveUpdateActivityId,
+  isLiveUpdateActivityType,
+  parseLiveUpdate,
+} from "./live-updates";
+export {
   pushPermissionFromExpo,
   type ExpoNotificationPermissions,
 } from "./push-permission";
@@ -47,4 +53,15 @@ export {
   type InAppHtmlBridgeMessage,
 } from "./html";
 export { useInAppCards, type UseInAppCardsResult } from "./react/useInAppCards";
+export {
+  SequenzyPlacement,
+  refreshPlacements,
+  type SequenzyPlacementProps,
+} from "./react/SequenzyPlacement";
+export { usePlacement, type UsePlacementResult } from "./react/usePlacement";
+export {
+  createPlacementStore,
+  type PlacementState,
+  type PlacementStore,
+} from "./react/placementStore";
 export type * from "./types";

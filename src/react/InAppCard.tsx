@@ -17,6 +17,13 @@ export interface InAppCardProps {
   onDismiss?: (card: InAppMessage) => void;
   /** Maps brand font families to fonts the app bundles. */
   fonts?: Record<string, string>;
+  /**
+   * `placement`: drawn inline for a placement, without the unread dot, pin
+   * and close control (`SequenzyPlacement` uses this).
+   */
+  variant?: "card" | "placement";
+  /** Handles every button instead of the default actions. */
+  onButtonPress?: (button: InAppButton) => void;
 }
 
 /** A small pin: a round head on a short needle, tilted. */
@@ -32,7 +39,14 @@ function PinGlyph({ color }: { color: string }) {
 }
 
 /** A content card drawn to mobile-sdks/DESIGN.md. Reports clicks and dismissals. */
-export function InAppCard({ card, onDismiss, fonts }: InAppCardProps) {
+export function InAppCard({
+  card,
+  onDismiss,
+  fonts,
+  variant = "card",
+  onButtonPress,
+}: InAppCardProps) {
+  const isPlacement = variant === "placement";
   const [imageFailed, setImageFailed] = useState(false);
   const font = resolveFontFamily(card.style, fonts);
   const palette = surfacePalette(card.style);
@@ -43,13 +57,14 @@ export function InAppCard({ card, onDismiss, fonts }: InAppCardProps) {
     else void Sequenzy.report("dismissed", card);
   };
   const press = (button: InAppButton) => {
-    if (button.action === "dismiss") dismiss();
+    if (onButtonPress) onButtonPress(button);
+    else if (button.action === "dismiss") dismiss();
     else void Sequenzy.handleButtonPress(button, card);
   };
 
   return (
     <View
-      testID={`sequenzy-card-${card.id}`}
+      testID={`sequenzy-${isPlacement ? "placement-item" : "card"}-${card.id}`}
       style={[
         styles.card,
         {
@@ -80,7 +95,7 @@ export function InAppCard({ card, onDismiss, fonts }: InAppCardProps) {
           </Text>
         ) : null}
         <View style={styles.header}>
-          {!card.readAt ? (
+          {!isPlacement && !card.readAt ? (
             <View
               accessibilityLabel="Unread"
               accessible
@@ -100,8 +115,12 @@ export function InAppCard({ card, onDismiss, fonts }: InAppCardProps) {
           >
             {card.title}
           </Text>
-          {card.pinned ? <PinGlyph color={palette.muted} /> : null}
-          <CloseButton palette={palette} size={24} onPress={dismiss} />
+          {!isPlacement && card.pinned ? (
+            <PinGlyph color={palette.muted} />
+          ) : null}
+          {isPlacement ? null : (
+            <CloseButton palette={palette} size={24} onPress={dismiss} />
+          )}
         </View>
         {card.body ? (
           <Text

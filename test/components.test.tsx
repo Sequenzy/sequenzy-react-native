@@ -92,6 +92,9 @@ const { createMemoryStorage } = await import("../src/storage");
 const { SequenzyInAppHost } = await import("../src/react/SequenzyInAppHost");
 const { InAppCard } = await import("../src/react/InAppCard");
 const { useInAppCards } = await import("../src/react/useInAppCards");
+const { SequenzyPlacement, refreshPlacements } =
+  await import("../src/react/SequenzyPlacement");
+const { createPlacementStore } = await import("../src/react/placementStore");
 const { resolveFontFamily } = await import("../src/react/styles");
 const platform = (await import("react-native")).Platform as { OS: string };
 
@@ -112,6 +115,14 @@ interface Call {
 
 let calls: Call[] = [];
 let feedMessages: unknown[] = [];
+const placementFixture = JSON.parse(
+  readFileSync(
+    join(import.meta.dir, "../../contract/fixtures/placements-response.json"),
+    "utf8"
+  )
+);
+// What each placement key shows; keys not listed are empty.
+let placementItems: Record<string, unknown> = {};
 
 async function configure(
   pushPermission?: Parameters<typeof Sequenzy.configure>[0]["pushPermission"]
@@ -132,6 +143,16 @@ async function configure(
         const path = new URL(url).pathname;
         const body = JSON.parse(init.body);
         calls.push({ path, body });
+        if (path === "/api/v1/in-app/feed/placements") {
+          const placements = (body.placements as string[]).map((key) => ({
+            placement: key,
+            message: placementItems[key] ?? null,
+          }));
+          return {
+            status: 200,
+            text: async () => JSON.stringify({ success: true, placements }),
+          };
+        }
         if (path === "/api/v1/in-app/feed") {
           // Like the API: html items only for callers that list html, push
           // primers only for callers that list the action.
@@ -179,6 +200,9 @@ beforeEach(async () => {
   calls = [];
   opened.length = 0;
   feedMessages = feed.messages;
+  placementItems = {
+    home_hero: placementFixture.placements[0].message,
+  };
   await configure();
 });
 
@@ -916,5 +940,287 @@ describe("custom HTML messages", () => {
     await settle();
     expect(reports("displayed")).toEqual(["iam_modal"]);
     expect(reports("dismissed")).toEqual([]);
+  });
+});
+
+describe("SequenzyPlacement", () => {
+  it("draws the slot's item inline, collapses empty slots and batches the fetch", async () => {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(
+        <>
+          <SequenzyPlacement placementId="home_hero" />
+          <SequenzyPlacement placementId="checkout_upsell" />
+        </>
+      );
+    });
+    await settle();
+
+    const placementCalls = calls.filter(
+      (call) => call.path === "/api/v1/in-app/feed/placements"
+    );
+    expect(placementCalls).toHaveLength(1);
+    expect(placementCalls[0]!.body.placements).toEqual([
+      "home_hero",
+      "checkout_upsell",
+    ]);
+    const slot = renderer.root.findByProps({
+      testID: "sequenzy-placement-home_hero",
+    });
+    expect(textOf(slot)).toContain("Upgrade to Pro, Jane");
+    // No unread dot or close control on placement items.
+    expect(slot.findAllByProps({ accessibilityLabel: "Unread" })).toHaveLength(
+      0
+    );
+    expect(slot.findAllByProps({ accessibilityLabel: "Close" })).toHaveLength(
+      0
+    );
+    expect(
+      renderer.root.findAllByProps({
+        testID: "sequenzy-placement-checkout_upsell",
+      })
+    ).toHaveLength(0);
+    expect(reports("displayed")).toEqual(["iam_placement"]);
+  });
+
+  it("draws banner and hero layouts with a filled primary button", async () => {
+    const flat = (style: unknown): Record<string, unknown> =>
+      Array.isArray(style)
+        ? Object.assign({}, ...style.map(flat))
+        : typeof style === "function"
+          ? flat(style({ pressed: false }))
+          : ((style ?? {}) as Record<string, unknown>);
+    const fixture = placementFixture.placements[0].message;
+    for (const layout of ["banner", "hero"] as const) {
+      placementItems = {
+        home_hero: { ...fixture, id: `iam_${layout}`, layout },
+      };
+      let renderer!: ReturnType<typeof create>;
+      await act(async () => {
+        renderer = create(<SequenzyPlacement placementId="home_hero" />);
+      });
+      // The shared store still holds the previous test's item.
+      await act(async () => refreshPlacements());
+      await settle();
+      const item = renderer.root.findByProps({
+        testID: `sequenzy-placement-item-iam_${layout}`,
+      });
+      const [primary] = item
+        .findAllByType("Pressable" as never)
+        .filter((node) => node.props.accessibilityRole === "button");
+      expect(flat(primary!.props.style).backgroundColor).toBe(
+        fixture.style.buttonColor
+      );
+      expect(flat(primary!.props.style).height).toBe(36);
+      const title = item
+        .findAllByType("Text" as never)
+        .find((node) => node.props.children === fixture.title);
+      // A hero draws its text over the image in white.
+      expect(flat(title!.props.style).color).toBe(
+        layout === "hero" ? "#ffffff" : fixture.style.textColor
+      );
+      // Leave the shared store as the other tests expect it.
+      placementItems = { home_hero: fixture };
+      await act(async () => refreshPlacements());
+      await settle();
+      act(() => renderer.unmount());
+    }
+  });
+
+  it("opens links, and on dismiss shows the next item", async () => {
+    let renderer!: ReturnType<typeof create>;
+    await act(async () => {
+      renderer = create(<SequenzyPlacement placementId="home_hero" />);
+    });
+    await settle();
+    const buttons = () =>
+      renderer.root
+        .findAllByType("Pressable" as never)
+        .filter((node) => node.props.accessibilityRole === "button");
+
+    await act(async () => buttons()[0]!.props.onPress());
+    await settle();
+    expect(reports("clicked")).toEqual(["iam_placement"]);
+    expect(opened).toEqual(["myapp://billing"]);
+
+    placementItems = {
+      home_hero: {
+        ...placementFixture.placements[0].message,
+        id: "iam_next",
+        title: "Next up",
+        buttons: [],
+      },
+    };
+    await act(async () => buttons()[1]!.props.onPress());
+    await settle();
+    expect(reports("dismissed")).toEqual(["iam_placement"]);
+    expect(
+      textOf(
+        renderer.root.findByProps({ testID: "sequenzy-placement-home_hero" })
+      )
+    ).toContain("Next up");
+  });
+
+  it("empties slots on reset and drops answers for the previous contact", async () => {
+    const listeners: Array<
+      (event: "identified" | "reset", email?: string) => void
+    > = [];
+    const resolvers: Array<(items: Record<string, unknown>) => void> = [];
+    const store = createPlacementStore({
+      fetchPlacements: () =>
+        new Promise((done) => {
+          resolvers.push(done as (items: Record<string, unknown>) => void);
+        }) as never,
+      report: async () => true,
+      addListener: (listener) => {
+        listeners.push(listener);
+        return () => undefined;
+      },
+    });
+    const seen: unknown[] = [];
+    const stop = store.subscribe("home_hero", (state) => seen.push(state.item));
+    await settle();
+    listeners.forEach((listener) => listener("reset"));
+    resolvers[0]?.({ home_hero: placementFixture.placements[0].message });
+    await settle();
+    expect(seen.every((item) => item === null)).toBe(true);
+    expect(store.get("home_hero").item).toBeNull();
+
+    // A different contact identifies while nothing is mounted: the cached
+    // slot is forgotten, so mounting again fetches for the new contact.
+    stop();
+    listeners.forEach((listener) => listener("identified", "ben@example.com"));
+    await settle();
+    store.subscribe("home_hero", () => undefined);
+    await settle();
+    expect(resolvers.length).toBe(2);
+  });
+
+  it("does not refetch from scratch or re-report when the same contact identifies again", async () => {
+    const listeners: Array<
+      (event: "identified" | "reset", email?: string) => void
+    > = [];
+    const item = placementFixture.placements[0].message;
+    const reported: string[] = [];
+    const store = createPlacementStore({
+      fetchPlacements: async () => ({ home_hero: item }) as never,
+      report: async (type) => {
+        reported.push(type);
+        return true;
+      },
+      addListener: (listener) => {
+        listeners.push(listener);
+        return () => undefined;
+      },
+      // Jane identified at launch, before any placement mounted.
+      identifiedEmail: async () => "jane@example.com",
+    });
+    const seen: unknown[] = [];
+    store.subscribe("home_hero", (state) => seen.push(state.item));
+    await settle();
+    store.logDisplayed(item);
+    listeners.forEach((listener) => listener("identified", "jane@example.com"));
+    await settle();
+    store.logDisplayed(item);
+    expect(seen.filter((entry) => entry === null)).toHaveLength(0);
+    expect(reported).toEqual(["displayed"]);
+  });
+
+  it("keeps a dismissed item hidden when a racing fetch returns it", async () => {
+    const item = placementFixture.placements[0].message;
+    const store = createPlacementStore({
+      fetchPlacements: async () => ({ home_hero: item }) as never,
+      report: async () => true,
+      addListener: () => () => undefined,
+    });
+    store.subscribe("home_hero", () => undefined);
+    await settle();
+    expect(store.get("home_hero").item?.id).toBe("iam_placement");
+    store.dismissed(item);
+    await settle();
+    expect(store.get("home_hero").item).toBeNull();
+  });
+
+  it("asks for the next item only after the dismissal is recorded", async () => {
+    const item = placementFixture.placements[0].message;
+    let fetches = 0;
+    const store = createPlacementStore({
+      fetchPlacements: async () => {
+        fetches += 1;
+        return { home_hero: { ...item, id: `iam_${fetches}` } } as never;
+      },
+      report: async () => true,
+      addListener: () => () => undefined,
+    });
+    store.subscribe("home_hero", () => undefined);
+    await settle();
+    const shown = store.get("home_hero").item!;
+    let record: () => void = () => undefined;
+    store.dismissed(shown, new Promise<void>((resolve) => (record = resolve)));
+    await settle();
+    // No refetch while the server may still serve the dismissed item.
+    expect(fetches).toBe(1);
+    record();
+    await settle();
+    expect(fetches).toBe(2);
+    expect(store.get("home_hero").item?.id).toBe("iam_2");
+  });
+
+  it("ignores an older answer that arrives after a newer one", async () => {
+    const item = placementFixture.placements[0].message;
+    let fetches = 0;
+    let answerStale: () => void = () => undefined;
+    const store = createPlacementStore({
+      fetchPlacements: async () => {
+        fetches += 1;
+        if (fetches === 2) {
+          await new Promise<void>((resolve) => (answerStale = resolve));
+          return { home_hero: item } as never;
+        }
+        return { home_hero: { ...item, id: `iam_${fetches}` } } as never;
+      },
+      report: async () => true,
+      addListener: () => () => undefined,
+    });
+    store.subscribe("home_hero", () => undefined);
+    await settle();
+    // A refresh is in flight with the old winner when the contact dismisses.
+    store.refresh("home_hero");
+    await settle();
+    store.dismissed(store.get("home_hero").item!);
+    await settle();
+    expect(store.get("home_hero").item?.id).toBe("iam_3");
+    answerStale();
+    await settle();
+    expect(store.get("home_hero").item?.id).toBe("iam_3");
+  });
+
+  it("resets failed-image state when a refreshed item replaces the slot", async () => {
+    const fixture = placementFixture.placements[0].message;
+    for (const layout of ["card", "banner", "hero"] as const) {
+      placementItems = {
+        home_hero: { ...fixture, id: `failed_${layout}`, layout },
+      };
+      let renderer!: ReturnType<typeof create>;
+      await act(async () => {
+        renderer = create(<SequenzyPlacement placementId="home_hero" />);
+      });
+      await act(async () => refreshPlacements());
+      await settle();
+      await act(async () => {
+        renderer.root.findByType("Image" as never).props.onError();
+      });
+      expect(renderer.root.findAllByType("Image" as never)).toHaveLength(0);
+      placementItems = {
+        home_hero: { ...fixture, id: `replacement_${layout}`, layout },
+      };
+      await act(async () => refreshPlacements());
+      await settle();
+      expect(renderer.root.findAllByType("Image" as never)).toHaveLength(1);
+      act(() => renderer.unmount());
+    }
+    placementItems = { home_hero: fixture };
+    await act(async () => refreshPlacements());
+    await settle();
   });
 });

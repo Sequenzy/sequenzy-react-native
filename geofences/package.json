@@ -1,6 +1,6 @@
 {
   "name": "@sequenzy/react-native-geofences",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Geofencing for the Sequenzy React Native SDK: native region monitoring on iOS and Android reports when signed-in users enter or leave your places",
   "keywords": [
     "sequenzy",

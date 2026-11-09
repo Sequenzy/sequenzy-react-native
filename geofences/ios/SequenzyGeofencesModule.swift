@@ -22,8 +22,9 @@ public class SequenzyGeofencesModule: Module {
         }.runOnQueue(.main)
 
         /// Resolves true when the native side holds this token as rejected.
-        AsyncFunction("setIdentity") { (email: String?, identityToken: String?) -> Bool in
-            SequenzyGeofenceBridge.shared.setIdentity(email: email, identityToken: identityToken)
+        AsyncFunction("setIdentity") { (email: String?, identityToken: String?, externalId: String?) -> Bool in
+            SequenzyGeofenceBridge.shared.setIdentity(
+                email: email, identityToken: identityToken, externalId: externalId)
         }.runOnQueue(.main)
 
         AsyncFunction("authorization") { () -> String in

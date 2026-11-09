@@ -25,11 +25,15 @@ import type {
   InAppEventType,
   InAppMessage,
   LiveActivityToken,
+  LiveUpdateActivity,
+  LiveUpdateActivityInput,
+  LiveUpdateDecision,
   PushPermissionStatus,
   SequenzyConfig,
 } from "./types";
 
-type Listener = (event: "identified" | "reset") => void;
+/** `email`: the contact identified, normalized; absent on reset. */
+type Listener = (event: "identified" | "reset", email?: string) => void;
 
 let client: SequenzyClient | null = null;
 const listeners = new Set<Listener>();
@@ -47,8 +51,8 @@ function requireClient(): SequenzyClient {
   return client;
 }
 
-function emit(event: "identified" | "reset") {
-  for (const listener of listeners) listener(event);
+function emit(event: "identified" | "reset", email?: string) {
+  for (const listener of listeners) listener(event, email);
 }
 
 /**
@@ -114,8 +118,46 @@ export const Sequenzy = {
     await current.identify(email, identityToken);
     const identified =
       (await current.getEmail()) === email.trim().toLowerCase();
-    if (identified) emit("identified");
+    if (identified) emit("identified", email.trim().toLowerCase());
     return identified;
+  },
+
+  /**
+   * Links this installation to the contact with your own user ID, for users
+   * without an email. Pass `email` too when you have it; the identity token
+   * must be minted for exactly these identifiers. Resolves false (and logs
+   * why) when the ID or email is not valid.
+   */
+  async identifyUser(
+    externalId: string,
+    options: { email?: string | null; identityToken?: string | null } = {}
+  ): Promise<boolean> {
+    const current = requireClient();
+    await current.identifyUser(externalId, options);
+    const identified =
+      (await current.getExternalId()) === externalId.trim() &&
+      (await current.getEmail()) ===
+        (options.email ? options.email.trim().toLowerCase() : null);
+    if (identified) {
+      emit(
+        "identified",
+        options.email ? options.email.trim().toLowerCase() : undefined
+      );
+    }
+    return identified;
+  },
+
+  /** The identified contact's normalized email, or null. */
+  identifiedEmail(): Promise<string | null> {
+    return client ? client.getEmail() : Promise.resolve(null);
+  },
+
+  /**
+   * One string per identified contact (the external ID or the email), or null
+   * while anonymous: compare it to notice that another user signed in.
+   */
+  identifiedContact(): Promise<string | null> {
+    return client ? client.getContactKey() : Promise.resolve(null);
   },
 
   async reset(): Promise<void> {
@@ -195,6 +237,59 @@ export const Sequenzy = {
   },
 
   /**
+   * Android Live Updates: reports this device can start activities of
+   * `activityType` (the same name as your iOS ActivityAttributes type, so
+   * one backend call reaches both). Call at launch for each type you draw.
+   */
+  observeLiveUpdates(activityType: string): Promise<void> {
+    return requireClient().observeLiveUpdates(activityType);
+  },
+
+  /**
+   * Android Live Updates: pass `remoteMessage.data` from Firebase
+   * Messaging's `onMessage` and `setBackgroundMessageHandler`. Returns what
+   * to show (post or update the notification with id `activityId`), or
+   * null for other messages.
+   */
+  handleLiveUpdate(
+    data: unknown,
+    options?: { canShow?: boolean }
+  ): Promise<LiveUpdateDecision | null> {
+    return requireClient().handleLiveUpdate(data, options);
+  },
+
+  /** Android Live Updates: starts an activity from the app; your backend updates and ends it by `activityId`. */
+  startLiveUpdate(input: LiveUpdateActivityInput): Promise<LiveUpdateDecision> {
+    return requireClient().startLiveUpdate(input);
+  },
+
+  /** Android Live Updates: updates a running activity from the app. */
+  updateLiveUpdate(
+    activityId: string,
+    contentState: Record<string, unknown>
+  ): Promise<LiveUpdateDecision> {
+    return requireClient().updateLiveUpdate(activityId, contentState);
+  },
+
+  /** Android Live Updates: ends a running activity from the app. */
+  endLiveUpdate(
+    activityId: string,
+    input?: { contentState?: Record<string, unknown>; dismissAtMs?: number }
+  ): Promise<LiveUpdateDecision> {
+    return requireClient().endLiveUpdate(activityId, input);
+  },
+
+  /** Android Live Updates: call when the person swipes one away. */
+  liveUpdateDismissed(activityId: string): Promise<void> {
+    return requireClient().liveUpdateDismissed(activityId);
+  },
+
+  /** Android Live Updates this device shows now. */
+  getLiveUpdates(): Promise<LiveUpdateActivity[]> {
+    return requireClient().getLiveUpdates();
+  },
+
+  /**
    * Call when the user taps a notification, with its data object. Reports the
    * click and opens the push URL. Returns false for other senders.
    */
@@ -248,6 +343,16 @@ export const Sequenzy = {
         ? { formats: ["modal", "banner", "fullscreen", "html"] }
         : {}),
     });
+  },
+
+  /**
+   * What each placement shows the identified contact (null: collapse the
+   * slot). `SequenzyPlacement` and `usePlacement` call this for you.
+   */
+  fetchPlacements(
+    placements: string[]
+  ): Promise<Record<string, InAppMessage | null>> {
+    return requireClient().fetchPlacements(placements);
   },
 
   fetchCards(limit?: number): Promise<InAppMessage[]> {

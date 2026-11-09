@@ -34,8 +34,10 @@ class SequenzyGeofencesModule : Module() {
         }
 
         // Resolves true when the native side holds this token as rejected.
-        AsyncFunction("setIdentity") { email: String?, identityToken: String?, promise: Promise ->
-            SequenzyGeofenceBridge.setIdentity(context, email, identityToken) { rejected -> promise.resolve(rejected) }
+        AsyncFunction("setIdentity") { email: String?, identityToken: String?, externalId: String?, promise: Promise ->
+            SequenzyGeofenceBridge.setIdentity(context, email, identityToken, externalId) { rejected ->
+                promise.resolve(rejected)
+            }
         }
 
         AsyncFunction("authorization") { SequenzyGeofenceBridge.authorization(context) }

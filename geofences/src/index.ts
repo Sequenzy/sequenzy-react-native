@@ -32,10 +32,14 @@ export interface GeofenceNativeModule {
     appId: string,
     userAgent: string
   ): Promise<void>;
-  /** Resolves true when the native side holds this token as rejected. */
+  /**
+   * Resolves true when the native side holds this token as rejected.
+   * `externalId` is set for users identified with `identifyUser`.
+   */
   setIdentity(
     email: string | null,
-    identityToken: string | null
+    identityToken: string | null,
+    externalId: string | null
   ): Promise<boolean>;
   authorization(): Promise<string>;
   requestAuthorization(): Promise<string>;
@@ -120,13 +124,18 @@ export function createSequenzyGeofences(dependencies: Dependencies) {
     }
     const rejected = await native.setIdentity(
       credentials?.email ?? null,
-      credentials?.identityToken ?? null
+      credentials?.identityToken ?? null,
+      credentials?.externalId ?? null
     );
     // The native side saw this token rejected while JavaScript was not running.
     if (rejected === true && !refreshToken && credentials) {
       const fresh = await client.identityCredentials({ refresh: true });
       if (fresh && fresh.identityToken !== credentials.identityToken) {
-        await native.setIdentity(fresh.email, fresh.identityToken);
+        await native.setIdentity(
+          fresh.email,
+          fresh.identityToken,
+          fresh.externalId
+        );
       }
     }
   }

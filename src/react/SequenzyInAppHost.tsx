@@ -88,15 +88,15 @@ export function SequenzyInAppHost({
       if (!force && now - lastFetch.current < refreshIntervalMs * 0.9) return;
       lastFetch.current = now;
       // Another contact signed in: the previous one's messages go.
-      const email = await client.getEmail();
-      if (email !== owner.current) {
+      const contact = await client.getContactKey();
+      if (contact !== owner.current) {
         clearMessages();
-        owner.current = email;
+        owner.current = contact;
       }
       const messages = await Sequenzy.fetchMessages({
         includeHtml: showsHtml,
       }).catch(() => null);
-      if (!messages || (await client.getEmail()) !== email) return;
+      if (!messages || (await client.getContactKey()) !== contact) return;
       for (const message of messages) {
         if (message.kind !== "message" || shown.current.has(message.id))
           continue;
@@ -182,7 +182,7 @@ export function SequenzyInAppHost({
     // as someone else its calls are dropped and it closes, unreported.
     const forOwner = (action: () => void) => {
       void (async () => {
-        if ((await Sequenzy.client?.getEmail()) !== messageOwner) {
+        if ((await Sequenzy.client?.getContactKey()) !== messageOwner) {
           if (visible.current?.id === message.id) close();
           return;
         }

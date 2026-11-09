@@ -7,6 +7,20 @@ import {
   type NearbyGeofences,
 } from "./geofences";
 import { isValidInAppButtonId } from "./html";
+import {
+  dismissLiveUpdate,
+  endLiveUpdateLocally,
+  parseLiveUpdate,
+  parseLiveUpdateRecords,
+  receiveLiveUpdate,
+  startLiveUpdateLocally,
+  toLiveUpdateActivity,
+  updateLiveUpdateLocally,
+  type LiveUpdateActivity,
+  type LiveUpdateDecision,
+  type LiveUpdateRecord,
+  type LiveUpdateStep,
+} from "./live-updates";
 import { defaultStorage, prefixedStorage } from "./storage";
 import type {
   CommerceCart,
@@ -20,6 +34,7 @@ import type {
   InAppMessage,
   KeyValueStorage,
   LiveActivityToken,
+  LiveUpdateActivityInput,
   LogLevel,
   ProfileUpdate,
   PushPayload,
@@ -28,11 +43,14 @@ import type {
   SequenzyConfig,
   SubscribeInput,
   SubscribeResult,
+  UserIdentityTokenProvider,
 } from "./types";
 
-export const SDK_VERSION = "0.2.0";
+export const SDK_VERSION = "0.2.1";
 export const DEFAULT_API_BASE_URL = "https://api.sequenzy.com";
 export const MAX_QUEUED_EVENTS = 100;
+/** Server limit for an external ID (the contact's `externalId`). */
+export const MAX_EXTERNAL_ID_LENGTH = 255;
 export const MAX_BATCH_SIZE = 20;
 export const MAX_EVENT_AGE_MS = 24 * 60 * 60 * 1000;
 export const PUSH_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -49,6 +67,9 @@ const PUSH_PERMISSION_STATUSES: readonly PushPermissionStatus[] = [
   "denied",
   "not_determined",
 ];
+/** Placement keys one request can ask for. */
+export const MAX_PLACEMENTS_PER_REQUEST = 10;
+
 /** Button actions this SDK handles beyond open_url and dismiss. */
 export const PUSH_PERMISSION_ACTION = "request_push_permission";
 
@@ -101,12 +122,14 @@ function withTimeout<T>(
 const KEYS = {
   anonymousId: "anonymousId",
   email: "email",
+  externalId: "externalId",
   identityToken: "identityToken",
   events: "events",
   pushToken: "pushToken",
   pushRegistration: "pushRegistration",
   profile: "profile",
   liveActivityTokens: "liveActivityTokens",
+  liveUpdates: "liveUpdates",
   geofenceTransitions: "geofenceTransitions",
 } as const;
 
@@ -189,6 +212,16 @@ export interface ClientDependencies {
   log?: (level: Exclude<LogLevel, "none">, message: string) => void;
 }
 
+/** The IANA zone the JS runtime reports, or null where Intl lacks it. */
+export function detectDeviceTimezone(): string | null {
+  try {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof zone === "string" && zone.length > 0 ? zone : null;
+  } catch {
+    return null;
+  }
+}
+
 export class SequenzyError extends Error {
   constructor(
     message: string,
@@ -199,6 +232,9 @@ export class SequenzyError extends Error {
     this.name = "SequenzyError";
   }
 }
+
+/** The identifiers sent with every identified request. */
+type IdentityFields = { email?: string; externalId?: string };
 
 type IdentifiedResult =
   | { kind: "response"; response: HttpResponse }
@@ -246,6 +282,7 @@ export class SequenzyClient {
     apiBaseUrl: string;
   };
   identityTokenProvider: ((email: string) => Promise<string>) | undefined;
+  userIdentityTokenProvider: UserIdentityTokenProvider | undefined;
   device: DeviceInfo;
   logLevel: LogLevel;
   pushPermission: PushPermissionHandler | undefined;
@@ -269,24 +306,33 @@ export class SequenzyClient {
   private state: {
     anonymousId: string | null;
     email: string | null;
+    /** Set by identifyUser: the app's own user ID. */
+    externalId: string | null;
     identityToken: string | null;
     pushToken: string | null;
     pushRegistration: {
       token: string;
+      /** The identity key (see identityKey) the device was linked to. */
       email: string;
       registeredAt: number;
       /** Permission sent with this registration; absent when unknown. */
       permission?: PushPermissionStatus;
     } | null;
     liveActivityTokens: LiveActivityToken[];
+    /** Android Live Updates this device shows or showed. */
+    liveUpdates: LiveUpdateRecord[];
   } = {
     anonymousId: null,
     email: null,
+    externalId: null,
     identityToken: null,
     pushToken: null,
     pushRegistration: null,
     liveActivityTokens: [],
+    liveUpdates: [],
   };
+  private readonly onLiveUpdatesRemoved:
+    ((activityIds: string[]) => void) | undefined;
   private backoffMs = 0;
   private nextAttemptAt: number | null = null;
   private retryHandle: unknown = null;
@@ -306,7 +352,9 @@ export class SequenzyClient {
       ),
     };
     this.identityTokenProvider = config.identityTokenProvider;
+    this.userIdentityTokenProvider = config.userIdentityTokenProvider;
     this.pushPermission = config.pushPermission;
+    this.onLiveUpdatesRemoved = config.onLiveUpdatesRemoved;
     this.device = config.device ?? {};
     this.logLevel = config.logLevel ?? "error";
     this.logImpl =
@@ -351,30 +399,36 @@ export class SequenzyClient {
     const [
       anonymousId,
       email,
+      externalId,
       identityToken,
       events,
       pushToken,
       pushRegistration,
       profile,
       liveActivityTokens,
+      liveUpdates,
     ] = await Promise.all([
       this.storage.getItem(KEYS.anonymousId),
       this.storage.getItem(KEYS.email),
+      this.storage.getItem(KEYS.externalId),
       this.storage.getItem(KEYS.identityToken),
       this.storage.getItem(KEYS.events),
       this.storage.getItem(KEYS.pushToken),
       this.storage.getItem(KEYS.pushRegistration),
       this.storage.getItem(KEYS.profile),
       this.storage.getItem(KEYS.liveActivityTokens),
+      this.storage.getItem(KEYS.liveUpdates),
     ]);
     this.pendingProfile = safeParse<ProfileUpdate>(profile);
     this.state = {
       anonymousId,
       email,
+      externalId,
       identityToken,
       pushToken,
       pushRegistration: safeParse(pushRegistration),
       liveActivityTokens: parseLiveActivityTokens(liveActivityTokens),
+      liveUpdates: parseLiveUpdateRecords(liveUpdates),
     };
     const parsed = safeParse<QueuedEvent[]>(events);
     this.events = Array.isArray(parsed) ? parsed : [];
@@ -413,11 +467,41 @@ export class SequenzyClient {
     return this.run(async () => this.state.email);
   }
 
+  /** The user ID passed to identifyUser, or null. */
+  getExternalId(): Promise<string | null> {
+    return this.run(async () => this.state.externalId);
+  }
+
+  /**
+   * One string per signed-in contact (the external ID or the email), or null
+   * while anonymous: compare it to notice that another user signed in.
+   */
+  getContactKey(): Promise<string | null> {
+    return this.run(async () => this.identityKey());
+  }
+
+  /**
+   * One string per contact: the external ID when the app identified the user
+   * by it, otherwise the email. Null while anonymous. The space keeps an
+   * external ID from ever equalling an email.
+   */
+  private identityKey(): string | null {
+    if (this.state.externalId) return `external ${this.state.externalId}`;
+    return this.state.email;
+  }
+
+  private identityFields(): IdentityFields {
+    return {
+      ...(this.state.email ? { email: this.state.email } : {}),
+      ...(this.state.externalId ? { externalId: this.state.externalId } : {}),
+    };
+  }
+
   queuedEventCount(): Promise<number> {
     return this.run(async () => this.events.length);
   }
 
-  /** Links this installation to a contact. */
+  /** Links this installation to the contact with this email. */
   identify(email: string, identityToken?: string | null): Promise<void> {
     return this.run(async () => {
       const normalized = email.trim().toLowerCase();
@@ -425,47 +509,112 @@ export class SequenzyClient {
         this.log("error", "identify was called with an invalid email address");
         return;
       }
-      const previous = this.state.email;
-      if (previous !== normalized) {
-        if (previous !== null) {
-          // Events and profile changes queued for the previous user must not
-          // be sent as the new one.
-          this.events = [];
-          this.pendingProfile = null;
-          await this.persistEvents();
-          await this.save("profile", null);
-        }
-        this.state.email = normalized;
-        this.state.identityToken = null;
-        await this.save("email", normalized);
-        await this.save("identityToken", null);
-        // Another contact's recent geofence transitions must not suppress this one's.
-        await this.save("geofenceTransitions", null);
-      }
-      if (identityToken) {
-        this.state.identityToken = identityToken;
-        await this.save("identityToken", identityToken);
-      }
-      this.identityBlocked = false;
-      this.providerRetryAt = 0;
-      await this.registerPushLocked(previous !== normalized);
-      if (previous !== normalized) {
-        if (previous !== null) {
-          // Another user signed in without reset: the previous user's
-          // running activities stay theirs, and only the device's
-          // push-to-start tokens move to the new contact.
-          this.state.liveActivityTokens = this.state.liveActivityTokens.filter(
-            (token) => token.kind === "push_to_start"
-          );
-          await this.persistLiveActivityTokens();
-        }
-        // Stored ActivityKit tokens link to the contact.
-        for (const token of this.state.liveActivityTokens) {
-          await this.sendLiveActivityToken(token);
-        }
-      }
-      await this.flushLocked();
+      await this.identifyLocked(
+        { email: normalized, externalId: null },
+        identityToken
+      );
     });
+  }
+
+  /**
+   * Links this installation to the contact with your own user ID, for users
+   * without an email (Sign in with Apple with a hidden address, phone login).
+   * Pass the email too when you have it. The identity token must be minted
+   * for exactly these identifiers.
+   */
+  identifyUser(
+    externalId: string,
+    options: { email?: string | null; identityToken?: string | null } = {}
+  ): Promise<void> {
+    return this.run(async () => {
+      const id = externalId.trim();
+      if (!id || id.length > MAX_EXTERNAL_ID_LENGTH) {
+        this.log(
+          "error",
+          `identifyUser needs a user ID of 1 to ${MAX_EXTERNAL_ID_LENGTH} characters`
+        );
+        return;
+      }
+      let email: string | null = null;
+      if (options.email?.trim()) {
+        email = options.email.trim().toLowerCase();
+        if (!email.includes("@") || /\s/.test(email)) {
+          this.log(
+            "error",
+            "identifyUser was called with an invalid email address"
+          );
+          return;
+        }
+      }
+      await this.identifyLocked(
+        { email, externalId: id },
+        options.identityToken
+      );
+    });
+  }
+
+  private async identifyLocked(
+    next: { email: string | null; externalId: string | null },
+    identityToken: string | null | undefined
+  ): Promise<void> {
+    const previous = this.identityKey();
+    const nextKey = next.externalId
+      ? `external ${next.externalId}`
+      : next.email;
+    const identifiersChanged =
+      this.state.email !== next.email ||
+      this.state.externalId !== next.externalId;
+    if (previous !== null && previous !== nextKey) {
+      // Events and profile changes queued for the previous user must not
+      // be sent as the new one.
+      this.events = [];
+      this.pendingProfile = null;
+      await this.persistEvents();
+      await this.save("profile", null);
+      // Another user signed in without reset: the previous user's
+      // running activities stay theirs, and only the device's
+      // push-to-start tokens move to the new contact. Done before the
+      // device registration below, which links Android tokens again.
+      // Android unlinks them on the server first, as reset does.
+      if (this.config.platform === "android") {
+        for (const liveToken of this.state.liveActivityTokens) {
+          await this.removeLiveActivityToken(liveToken.token, true);
+        }
+      }
+      this.state.liveActivityTokens = this.state.liveActivityTokens.filter(
+        (token) => token.kind === "push_to_start"
+      );
+      await this.persistLiveActivityTokens();
+      await this.clearLiveUpdates();
+    }
+    if (identifiersChanged) {
+      // A token verifies only with the exact identifiers it was minted for.
+      this.state.email = next.email;
+      this.state.externalId = next.externalId;
+      this.state.identityToken = null;
+      await this.save("email", next.email);
+      await this.save("externalId", next.externalId);
+      await this.save("identityToken", null);
+    }
+    if (previous !== nextKey) {
+      // Another contact's recent geofence transitions must not suppress this one's.
+      await this.save("geofenceTransitions", null);
+    }
+    if (identityToken) {
+      this.state.identityToken = identityToken;
+      await this.save("identityToken", identityToken);
+    }
+    this.identityBlocked = false;
+    this.providerRetryAt = 0;
+    await this.registerPushLocked(identifiersChanged);
+    // Stored ActivityKit tokens link to the contact. Android sends its
+    // Live Update tokens after the device registration above instead.
+    if (identifiersChanged && this.config.platform !== "android") {
+      for (const token of this.state.liveActivityTokens) {
+        await this.sendLiveActivityToken(token);
+      }
+    }
+    await this.flushLocked();
   }
 
   /** Forgets the user: unregisters the push token, clears identity, queue and anonymous id. */
@@ -503,6 +652,7 @@ export class SequenzyClient {
         (liveToken) => liveToken.kind === "push_to_start"
       );
       this.state.email = null;
+      this.state.externalId = null;
       this.state.identityToken = null;
       this.state.pushRegistration = null;
       this.state.anonymousId = this.uuid();
@@ -511,6 +661,7 @@ export class SequenzyClient {
       await Promise.all([
         this.save("profile", null),
         this.save("email", null),
+        this.save("externalId", null),
         this.save("identityToken", null),
         this.save("pushRegistration", null),
         this.save("geofenceTransitions", null),
@@ -523,8 +674,13 @@ export class SequenzyClient {
       this.backoffMs = 0;
       this.nextAttemptAt = null;
       this.identityBlocked = false;
-      for (const liveToken of this.state.liveActivityTokens) {
-        await this.sendLiveActivityToken(liveToken);
+      await this.clearLiveUpdates();
+      // Android links its Live Update tokens again with the next device
+      // registration: the device was just unregistered.
+      if (this.config.platform !== "android") {
+        for (const liveToken of this.state.liveActivityTokens) {
+          await this.sendLiveActivityToken(liveToken);
+        }
       }
     });
   }
@@ -725,7 +881,7 @@ export class SequenzyClient {
 
   private async flushLocked(): Promise<void> {
     if (this.pendingProfile) {
-      if (!this.state.email || this.identityBlocked) return;
+      if (!this.identityKey() || this.identityBlocked) return;
       if (this.nextAttemptAt !== null && this.nextAttemptAt > this.now())
         return;
       const outcome = await this.sendProfile(this.pendingProfile);
@@ -741,7 +897,7 @@ export class SequenzyClient {
     }
     await this.dropStaleEvents();
     while (this.events.length > 0) {
-      if (!this.state.email || this.identityBlocked) return;
+      if (!this.identityKey() || this.identityBlocked) return;
       if (this.nextAttemptAt !== null && this.nextAttemptAt > this.now())
         return;
       const batch = this.events.slice(0, MAX_BATCH_SIZE);
@@ -764,11 +920,11 @@ export class SequenzyClient {
   private async sendBatch(
     batch: QueuedEvent[]
   ): Promise<"delivered" | "dropped" | "retry" | "stop"> {
-    const result = await this.withIdentity((email, identityToken) =>
+    const result = await this.withIdentity((identity, identityToken) =>
       this.post("/api/v1/app-events", {
         companyId: this.config.companyId,
         publicKey: this.config.publicKey,
-        email,
+        ...identity,
         identityToken,
         events: batch,
       })
@@ -802,11 +958,11 @@ export class SequenzyClient {
   private async sendProfile(
     update: ProfileUpdate
   ): Promise<"delivered" | "dropped" | "retry" | "stop"> {
-    const result = await this.withIdentity((email, identityToken) =>
+    const result = await this.withIdentity((identity, identityToken) =>
       this.post("/api/v1/app-attributes", {
         companyId: this.config.companyId,
         publicKey: this.config.publicKey,
-        email,
+        ...identity,
         identityToken,
         ...update,
       })
@@ -918,7 +1074,7 @@ export class SequenzyClient {
   private async registerPushLocked(force: boolean): Promise<void> {
     const token = this.state.pushToken;
     if (!token || this.config.platform === "web") return;
-    const identity = this.state.email ?? "";
+    const identity = this.identityKey() ?? "";
     const permission = await this.readPushPermission();
     const last = this.state.pushRegistration;
     if (
@@ -947,14 +1103,24 @@ export class SequenzyClient {
       "locale",
       "timezone",
     ] as const) {
-      const value = this.device[key];
+      // The device timezone lets push campaigns deliver in each contact's
+      // local time. Read at each registration (the user may have travelled)
+      // when the app does not pass one; null opts out.
+      const value =
+        key === "timezone" && this.device.timezone === undefined
+          ? detectDeviceTimezone()
+          : this.device[key];
       if (value) base[key] = value;
     }
 
     let response: HttpResponse | null = null;
-    if (this.state.email) {
-      const result = await this.withIdentity((email, identityToken) =>
-        this.post("/api/v1/push/app-devices", { ...base, email, identityToken })
+    if (this.identityKey()) {
+      const result = await this.withIdentity((fields, identityToken) =>
+        this.post("/api/v1/push/app-devices", {
+          ...base,
+          ...fields,
+          identityToken,
+        })
       );
       if (result.kind === "response") {
         response = result.response;
@@ -1000,6 +1166,13 @@ export class SequenzyClient {
         `Device registered, but ${this.config.platform} push credentials are not set up in Sequenzy yet`
       );
     }
+    // Android Live Update tokens are sent to this FCM token and contact:
+    // link them again whenever either may have changed.
+    if (this.config.platform === "android") {
+      for (const liveToken of this.state.liveActivityTokens) {
+        await this.sendLiveActivityToken(liveToken);
+      }
+    }
   }
 
   /**
@@ -1011,8 +1184,8 @@ export class SequenzyClient {
    */
   registerLiveActivityToken(input: LiveActivityToken): Promise<void> {
     return this.run(async () => {
-      if (this.config.platform !== "ios") {
-        this.log("error", "Live Activities are only available on iOS");
+      if (this.config.platform === "web") {
+        this.log("error", "Live Activities are only available in apps");
         return;
       }
       const token = normalizeLiveActivityToken(input);
@@ -1055,6 +1228,239 @@ export class SequenzyClient {
     return this.run(async () => [...this.state.liveActivityTokens]);
   }
 
+  // region Android Live Updates (rules in live-updates.ts)
+
+  /**
+   * Android: reports that this device draws Live Updates of `activityType`
+   * (use your iOS ActivityAttributes type name, so one backend call
+   * reaches both), with a push-to-start token generated once per type.
+   */
+  observeLiveUpdates(activityType: string): Promise<void> {
+    return this.run(async () => {
+      if (!this.requireAndroid("observeLiveUpdates")) return;
+      const existing = this.state.liveActivityTokens.find(
+        (token) =>
+          token.kind === "push_to_start" && token.activityType === activityType
+      );
+      const token =
+        existing ??
+        normalizeLiveActivityToken({
+          kind: "push_to_start",
+          activityType,
+          token: this.newLiveUpdateToken(),
+        });
+      if (!token) {
+        this.log(
+          "error",
+          `observeLiveUpdates: "${activityType}" is not a valid type name`
+        );
+        return;
+      }
+      // A known token is linked again with every device registration.
+      if (existing) return;
+      this.state.liveActivityTokens = this.capTokens([
+        ...this.state.liveActivityTokens,
+        token,
+      ]);
+      await this.persistLiveActivityTokens();
+      await this.sendLiveActivityToken(token);
+    });
+  }
+
+  /**
+   * Android: applies a Sequenzy Live Update push (`remoteMessage.data`) and
+   * says what to show. Returns null for other messages. Pass `canShow:
+   * false` when the app does not draw this type or may not post
+   * notifications: Sequenzy then stops counting the activity as running.
+   */
+  handleLiveUpdate(
+    data: unknown,
+    options: { canShow?: boolean } = {}
+  ): Promise<LiveUpdateDecision | null> {
+    return this.run(async () => {
+      const payload = parseLiveUpdate(data);
+      if (!payload) return null;
+      return this.applyLiveUpdateStep(
+        receiveLiveUpdate(this.state.liveUpdates, payload, {
+          canShow: options.canShow ?? true,
+          nowMs: this.now(),
+          newToken: () => this.newLiveUpdateToken(),
+        })
+      );
+    });
+  }
+
+  /** Android: starts an activity from the app, so your backend can update and end it. */
+  startLiveUpdate(input: LiveUpdateActivityInput): Promise<LiveUpdateDecision> {
+    return this.run(async () => {
+      if (!this.requireAndroid("startLiveUpdate")) {
+        return { action: "ignore", reason: "invalid" } as const;
+      }
+      return this.applyLiveUpdateStep(
+        startLiveUpdateLocally(
+          this.state.liveUpdates,
+          {
+            activityType: input.activityType,
+            activityId: input.activityId,
+            attributes: input.attributes ?? {},
+            contentState: input.contentState ?? {},
+            staleDateMs: input.staleDateMs ?? null,
+          },
+          { nowMs: this.now(), newToken: () => this.newLiveUpdateToken() }
+        )
+      );
+    });
+  }
+
+  /** Android: updates a running activity from the app. */
+  updateLiveUpdate(
+    activityId: string,
+    contentState: Record<string, unknown>
+  ): Promise<LiveUpdateDecision> {
+    return this.run(async () =>
+      this.applyLiveUpdateStep(
+        updateLiveUpdateLocally(
+          this.state.liveUpdates,
+          activityId,
+          contentState,
+          this.now()
+        )
+      )
+    );
+  }
+
+  /**
+   * Android: ends a running activity from the app and tells Sequenzy, so
+   * later backend updates are not sent. Without `dismissAtMs` the final
+   * content stays up to four hours, as on iOS.
+   */
+  endLiveUpdate(
+    activityId: string,
+    input: { contentState?: Record<string, unknown>; dismissAtMs?: number } = {}
+  ): Promise<LiveUpdateDecision> {
+    return this.run(async () =>
+      this.applyLiveUpdateStep(
+        endLiveUpdateLocally(
+          this.state.liveUpdates,
+          activityId,
+          input,
+          this.now()
+        )
+      )
+    );
+  }
+
+  /** Android: call when the person swipes a Live Update away (Notifee's DISMISSED event). */
+  liveUpdateDismissed(activityId: string): Promise<void> {
+    return this.run(async () => {
+      await this.applyLiveUpdateStep(
+        dismissLiveUpdate(this.state.liveUpdates, activityId)
+      );
+    });
+  }
+
+  /** Android: the Live Updates this device shows now. */
+  getLiveUpdates(): Promise<LiveUpdateActivity[]> {
+    return this.run(async () =>
+      this.state.liveUpdates
+        .filter((record) => record.state === "active")
+        .map(toLiveUpdateActivity)
+    );
+  }
+
+  private requireAndroid(method: string): boolean {
+    if (this.config.platform === "android") return true;
+    this.log(
+      "error",
+      `${method} is for Android Live Updates; on iOS use Live Activities`
+    );
+    return false;
+  }
+
+  /**
+   * 64 random hex characters. The token alone authorizes ending the
+   * activity, so it comes from crypto.getRandomValues when the runtime has
+   * it (Hermes needs react-native-get-random-values).
+   */
+  private newLiveUpdateToken(): string {
+    const cryptoObject = (
+      globalThis as {
+        crypto?: { getRandomValues?: (array: Uint8Array) => Uint8Array };
+      }
+    ).crypto;
+    if (cryptoObject?.getRandomValues) {
+      const bytes = cryptoObject.getRandomValues(new Uint8Array(32));
+      return Array.from(bytes, (byte) =>
+        byte.toString(16).padStart(2, "0")
+      ).join("");
+    }
+    return `${this.uuid()}${this.uuid()}`.replace(/-/g, "").toLowerCase();
+  }
+
+  /** Newest tokens first to go; push-to-start tokens are kept. */
+  private capTokens(tokens: LiveActivityToken[]): LiveActivityToken[] {
+    if (tokens.length <= MAX_LIVE_ACTIVITY_TOKENS) return tokens;
+    const starts = tokens.filter((token) => token.kind === "push_to_start");
+    const updates = tokens.filter((token) => token.kind !== "push_to_start");
+    const room = Math.max(0, MAX_LIVE_ACTIVITY_TOKENS - starts.length);
+    return [
+      ...starts.slice(-MAX_LIVE_ACTIVITY_TOKENS),
+      ...updates.slice(updates.length - Math.min(room, updates.length)),
+    ];
+  }
+
+  private async applyLiveUpdateStep(
+    step: LiveUpdateStep
+  ): Promise<LiveUpdateDecision> {
+    this.state.liveUpdates = step.records;
+    await this.save("liveUpdates", JSON.stringify(step.records));
+    const drop = [step.forget, step.remove].filter((token): token is string =>
+      Boolean(token)
+    );
+    if (drop.length > 0) {
+      this.state.liveActivityTokens = this.state.liveActivityTokens.filter(
+        (stored) => !drop.includes(stored.token)
+      );
+      await this.persistLiveActivityTokens();
+    }
+    if (step.remove) await this.removeLiveActivityToken(step.remove, false);
+    if (step.register) {
+      const token = normalizeLiveActivityToken({
+        kind: "update",
+        ...step.register,
+      });
+      if (token) {
+        this.state.liveActivityTokens = this.capTokens([
+          ...this.state.liveActivityTokens.filter(
+            (stored) => !replacesLiveActivityToken(token, stored)
+          ),
+          token,
+        ]);
+        await this.persistLiveActivityTokens();
+        await this.sendLiveActivityToken(token);
+      }
+    }
+    return step.decision;
+  }
+
+  /** Forgets every Live Update and asks the app to remove those still showing, running or ended. */
+  private async clearLiveUpdates(): Promise<void> {
+    const running = this.state.liveUpdates
+      .filter((record) => record.state !== "dismissed" && record.token !== "")
+      .map((record) => record.activityId);
+    this.state.liveUpdates = [];
+    await this.save("liveUpdates", null);
+    if (running.length > 0) {
+      try {
+        this.onLiveUpdatesRemoved?.(running);
+      } catch (error) {
+        this.log("error", `onLiveUpdatesRemoved threw: ${String(error)}`);
+      }
+    }
+  }
+
+  // endregion
+
   private persistLiveActivityTokens(): Promise<void> {
     return this.save(
       "liveActivityTokens",
@@ -1065,9 +1471,14 @@ export class SequenzyClient {
   }
 
   private async sendLiveActivityToken(token: LiveActivityToken): Promise<void> {
+    const android = this.config.platform === "android";
+    // Sequenzy sends Android Live Updates to the FCM token; without one
+    // there is nothing to link, and the device registration sends it later.
+    if (android && !this.state.pushToken) return;
     const base: Record<string, unknown> = {
       companyId: this.config.companyId,
       publicKey: this.config.publicKey,
+      ...(android ? { platform: "android" } : {}),
       kind: token.kind,
       activityType: token.activityType,
       ...(token.activityId ? { activityId: token.activityId } : {}),
@@ -1082,9 +1493,9 @@ export class SequenzyClient {
     }
     const path = "/api/v1/push/live-activities";
     let response: HttpResponse | null;
-    if (this.state.email) {
-      const result = await this.withIdentity((email, identityToken) =>
-        this.post(path, { ...base, email, identityToken })
+    if (this.identityKey()) {
+      const result = await this.withIdentity((identity, identityToken) =>
+        this.post(path, { ...base, ...identity, identityToken })
       );
       if (result.kind === "response") {
         response = result.response;
@@ -1217,11 +1628,11 @@ export class SequenzyClient {
     } = {}
   ): Promise<InAppMessage[]> {
     return this.run(async () => {
-      const result = await this.withIdentity((email, identityToken) =>
+      const result = await this.withIdentity((identity, identityToken) =>
         this.post("/api/v1/in-app/feed", {
           companyId: this.config.companyId,
           publicKey: this.config.publicKey,
-          email,
+          ...identity,
           identityToken,
           ...(options.kind ? { kind: options.kind } : {}),
           ...(options.limit ? { limit: options.limit } : {}),
@@ -1232,7 +1643,7 @@ export class SequenzyClient {
       );
       if (result.kind === "not_identified")
         throw new SequenzyError(
-          "Call identify(email, identityToken) first",
+          "Call identify or identifyUser with an identity token first",
           "not_identified"
         );
       if (result.kind === "rejected")
@@ -1254,6 +1665,65 @@ export class SequenzyClient {
     });
   }
 
+  /**
+   * What each placement shows the identified contact: the highest-priority
+   * open item per key, or null when the slot should collapse. Up to 10 keys.
+   */
+  fetchPlacements(
+    placements: string[]
+  ): Promise<Record<string, InAppMessage | null>> {
+    return this.run(async () => {
+      const keys = [...new Set(placements.map((key) => key.trim()))]
+        .filter(Boolean)
+        .slice(0, MAX_PLACEMENTS_PER_REQUEST);
+      if (keys.length === 0) return {};
+      const result = await this.withIdentity((identity, identityToken) =>
+        this.post("/api/v1/in-app/feed/placements", {
+          companyId: this.config.companyId,
+          publicKey: this.config.publicKey,
+          ...identity,
+          identityToken,
+          placements: keys,
+          ...(this.pushPermission ? { actions: [PUSH_PERMISSION_ACTION] } : {}),
+        })
+      );
+      if (result.kind === "not_identified")
+        throw new SequenzyError(
+          "Call identify or identifyUser with an identity token first",
+          "not_identified"
+        );
+      if (result.kind === "rejected")
+        throw new SequenzyError(
+          "The identity token was rejected",
+          "identity_rejected"
+        );
+      if (result.kind === "failed") throw result.error;
+      const { status, body } = result.response;
+      if (status < 200 || status >= 300) {
+        throw new SequenzyError(
+          `HTTP ${status} ${errorMessage(body)}`.trim(),
+          "http",
+          status
+        );
+      }
+      const entries = Array.isArray(body?.["placements"])
+        ? (body["placements"] as unknown[])
+        : [];
+      const items: Record<string, InAppMessage | null> = {};
+      for (const key of keys) items[key] = null;
+      for (const entry of entries) {
+        if (!entry || typeof entry !== "object") continue;
+        const { placement, message } = entry as Record<string, unknown>;
+        if (typeof placement !== "string" || !(placement in items)) continue;
+        items[placement] =
+          message && typeof message === "object"
+            ? (message as InAppMessage)
+            : null;
+      }
+      return items;
+    });
+  }
+
   // region Geofences
 
   /** The nearest active geofences around a position, rounded to two
@@ -1263,11 +1733,11 @@ export class SequenzyClient {
     limit: number
   ): Promise<NearbyGeofences> {
     return this.run(async () => {
-      const result = await this.withIdentity((email, identityToken) =>
+      const result = await this.withIdentity((identity, identityToken) =>
         this.post("/api/v1/geofences/nearby", {
           companyId: this.config.companyId,
           publicKey: this.config.publicKey,
-          email,
+          ...identity,
           identityToken,
           latitude: roundCoordinate(position.latitude),
           longitude: roundCoordinate(position.longitude),
@@ -1276,7 +1746,7 @@ export class SequenzyClient {
       );
       if (result.kind === "not_identified")
         throw new SequenzyError(
-          "Call identify(email, identityToken) first",
+          "Call identify or identifyUser with an identity token first",
           "not_identified"
         );
       if (result.kind === "rejected")
@@ -1311,7 +1781,7 @@ export class SequenzyClient {
       if (!id || id === GEOFENCE_REFRESH_REGION_ID) return false;
       if (transition !== "enter" && transition !== "exit") return false;
       // Visits belong to a contact; never queue one for whoever signs in next.
-      if (!this.state.email) return false;
+      if (!this.identityKey()) return false;
       const occurredAt = at ? at.getTime() : this.now();
       const stored =
         safeParse<Record<string, number>>(
@@ -1351,20 +1821,28 @@ export class SequenzyClient {
     });
   }
 
-  /** The signed-in email and its identity token, for native code that
-   * reports while JavaScript is not running (the geofence module). Asks the
-   * identity token provider when no token is stored or `refresh` is set. */
-  identityCredentials(
-    options: { refresh?: boolean } = {}
-  ): Promise<{ email: string; identityToken: string } | null> {
+  /** The signed-in user's identifiers and identity token, for native code
+   * that reports while JavaScript is not running (the geofence module). Asks
+   * the identity token provider when no token is stored or `refresh` is set.
+   * `email` is null for a user identified by external ID only. */
+  identityCredentials(options: { refresh?: boolean } = {}): Promise<{
+    email: string | null;
+    externalId: string | null;
+    identityToken: string;
+  } | null> {
     return this.run(async () => {
-      const email = this.state.email;
-      if (!email) return null;
+      if (!this.identityKey()) return null;
       let token = this.state.identityToken;
       if (!token || options.refresh) {
-        token = (await this.tokenFromProvider(email)) ?? token;
+        token = (await this.tokenFromProvider()) ?? token;
       }
-      return token ? { email, identityToken: token } : null;
+      return token
+        ? {
+            email: this.state.email,
+            externalId: this.state.externalId,
+            identityToken: token,
+          }
+        : null;
     });
   }
 
@@ -1382,11 +1860,11 @@ export class SequenzyClient {
     options: { pushPermission?: PushPermissionStatus | null } = {}
   ): Promise<boolean> {
     return this.run(async () => {
-      const result = await this.withIdentity((email, identityToken) =>
+      const result = await this.withIdentity((identity, identityToken) =>
         this.post("/api/v1/in-app/feed/events", {
           companyId: this.config.companyId,
           publicKey: this.config.publicKey,
-          email,
+          ...identity,
           identityToken,
           messageId,
           type,
@@ -1413,27 +1891,32 @@ export class SequenzyClient {
   // region Identity tokens and HTTP
 
   private async withIdentity(
-    operation: (email: string, token: string) => Promise<HttpResponse>
+    operation: (
+      identity: IdentityFields,
+      token: string
+    ) => Promise<HttpResponse>
   ): Promise<IdentifiedResult> {
-    const email = this.state.email;
-    if (!email || this.identityBlocked) return { kind: "not_identified" };
+    if (!this.identityKey() || this.identityBlocked) {
+      return { kind: "not_identified" };
+    }
+    const identity = this.identityFields();
     let usedProvider = false;
     let token = this.state.identityToken;
     if (!token) {
-      token = await this.tokenFromProvider(email);
+      token = await this.tokenFromProvider();
       usedProvider = true;
     }
     if (!token) {
       this.log(
         "info",
-        "No identity token yet; call identify(email, identityToken) or set identityTokenProvider"
+        "No identity token yet; pass one to identify or identifyUser, or set an identity token provider"
       );
       return { kind: "not_identified" };
     }
     for (;;) {
       let response: HttpResponse;
       try {
-        response = await operation(email, token);
+        response = await operation(identity, token);
       } catch (error) {
         return { kind: "failed", error };
       }
@@ -1445,7 +1928,7 @@ export class SequenzyClient {
       await this.save("identityToken", null);
       if (!usedProvider) {
         usedProvider = true;
-        const fresh = await this.tokenFromProvider(email);
+        const fresh = await this.tokenFromProvider();
         if (fresh) {
           token = fresh;
           continue;
@@ -1454,24 +1937,39 @@ export class SequenzyClient {
       this.identityBlocked = true;
       this.log(
         "error",
-        "The identity token was rejected; call identify(email, identityToken) with a fresh token"
+        "The identity token was rejected; call identify or identifyUser again with a fresh token"
       );
       return { kind: "rejected" };
     }
   }
 
-  private async tokenFromProvider(email: string): Promise<string | null> {
-    if (!this.identityTokenProvider) return null;
+  /**
+   * A fresh token for the current identity: from `userIdentityTokenProvider`
+   * for a user identified by external ID, otherwise from
+   * `identityTokenProvider` with the email.
+   */
+  private async tokenFromProvider(): Promise<string | null> {
+    const key = this.identityKey();
+    const { email, externalId } = this.state;
+    let request: (() => Promise<string>) | null = null;
+    if (externalId) {
+      const provider = this.userIdentityTokenProvider;
+      if (provider) request = () => provider({ externalId, email });
+    } else if (email) {
+      const provider = this.identityTokenProvider;
+      if (provider) request = () => provider(email);
+    }
+    if (!request) return null;
     if (this.now() < this.providerRetryAt) return null;
     try {
       // Calls are serialized, so a provider that never settles (or awaits a
       // Sequenzy call) would stall every later call without the timeout.
       const token = await withTimeout(
-        this.identityTokenProvider(email),
+        request(),
         REQUEST_TIMEOUT_MS,
         "The identity token provider"
       );
-      if (!token || this.state.email !== email) return null;
+      if (!token || this.identityKey() !== key) return null;
       this.state.identityToken = token;
       await this.save("identityToken", token);
       return token;

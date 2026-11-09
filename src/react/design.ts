@@ -32,6 +32,7 @@ export const TYPE = {
   cardTitle: { fontSize: 16, lineHeight: 21, fontWeight: "600" },
   cardBody: { fontSize: 14, lineHeight: 20 },
   cardLink: { fontSize: 15, lineHeight: 20, fontWeight: "600" },
+  heroTitle: { fontSize: 20, lineHeight: 26, fontWeight: "700" },
 } as const;
 
 /** The web has no native animation driver; asking for it only warns. */

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it, mock } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -7,6 +7,7 @@ import {
   PROVIDER_RETRY_MS,
   PUSH_REFRESH_INTERVAL_MS,
   SequenzyClient,
+  detectDeviceTimezone,
   normalizeLiveActivityToken,
   type FetchLike,
 } from "../src/client";
@@ -116,13 +117,16 @@ function createHarness() {
         storage,
         identityTokenProvider: provider,
         ...extra,
-        device: {
-          appVersion: "1.0",
-          osVersion: "18.0",
-          deviceName: "Test",
-          locale: "en-US",
-          timezone: "UTC",
-        },
+        device:
+          "device" in extra
+            ? extra.device
+            : {
+                appVersion: "1.0",
+                osVersion: "18.0",
+                deviceName: "Test",
+                locale: "en-US",
+                timezone: "UTC",
+              },
         logLevel: "none",
       },
       {
@@ -217,6 +221,48 @@ describe("SequenzyClient contract", () => {
     expect(identified!.body["appVersion"]).toBe("1.0");
   });
 
+  it("reports the device timezone unless the app opts out", async () => {
+    const detected = detectDeviceTimezone();
+    expect(detected).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+
+    await harness
+      .make(undefined, { device: { appVersion: "1.0" } })
+      .setPushToken(token);
+    expect(
+      harness.to("/api/v1/push/app-devices").at(-1)!.body["timezone"]
+    ).toBe(detected);
+
+    // A zone change while the app stays open is picked up on the next
+    // registration.
+    const travelling = harness.make(undefined, { device: {} });
+    const originalFormat = Intl.DateTimeFormat;
+    try {
+      (Intl as { DateTimeFormat: unknown }).DateTimeFormat = function () {
+        return { resolvedOptions: () => ({ timeZone: "Pacific/Auckland" }) };
+      };
+      await travelling.setPushToken("ab".repeat(32));
+    } finally {
+      (Intl as { DateTimeFormat: unknown }).DateTimeFormat = originalFormat;
+    }
+    expect(
+      harness.to("/api/v1/push/app-devices").at(-1)!.body["timezone"]
+    ).toBe("Pacific/Auckland");
+
+    await harness
+      .make(undefined, { device: { timezone: "Asia/Tokyo" } })
+      .setPushToken("cd".repeat(32));
+    expect(
+      harness.to("/api/v1/push/app-devices").at(-1)!.body["timezone"]
+    ).toBe("Asia/Tokyo");
+
+    await harness
+      .make(undefined, { device: { timezone: null } })
+      .setPushToken("ef".repeat(32));
+    expect(
+      harness.to("/api/v1/push/app-devices").at(-1)!.body["timezone"]
+    ).toBeUndefined();
+  });
+
   it("tracks events", async () => {
     const client = harness.make();
     await client.identify(email, identityToken);
@@ -258,6 +304,35 @@ describe("SequenzyClient contract", () => {
 
     expect(await client.report("displayed", "iam_modal")).toBe(true);
     expectContract(harness.requests.at(-1), "reportInAppEvent");
+  });
+
+  it("fetches placements and reports their display", async () => {
+    harness.respondTo(
+      "/api/v1/in-app/feed/placements",
+      200,
+      JSON.parse(fixture("placements-response.json"))
+    );
+    const client = harness.make();
+    await client.identify(email, identityToken);
+    const placements = await client.fetchPlacements([
+      "home_hero",
+      "checkout_upsell",
+      "home_hero",
+    ]);
+    expectContract(
+      harness.to("/api/v1/in-app/feed/placements").at(-1),
+      "fetchPlacements"
+    );
+    expect(placements["home_hero"]).toMatchObject({
+      id: "iam_placement",
+      kind: "placement",
+      placement: "home_hero",
+    });
+    expect(placements["checkout_upsell"]).toBeNull();
+    expect(await client.fetchPlacements([" "])).toEqual({});
+
+    expect(await client.report("displayed", "iam_placement")).toBe(true);
+    expectContract(harness.requests.at(-1), "reportPlacementDisplayed");
   });
 
   it("fetches custom HTML only when asked and reports button ids", async () => {
@@ -1124,11 +1199,13 @@ describe("Geofences", () => {
     await client.identify(email, identityToken);
     expect(await client.identityCredentials()).toEqual({
       email,
+      externalId: null,
       identityToken,
     });
     expect(calls).toBe(0);
     expect(await client.identityCredentials({ refresh: true })).toEqual({
       email,
+      externalId: null,
       identityToken: "seq_wid_fresh.1",
     });
     await client.reset();
@@ -1203,5 +1280,96 @@ describe("custom HTML bridge contract", () => {
       expect(isAllowedInAppUrl(url)).toBe(true);
     for (const url of bridge.urls.blocked)
       expect(isAllowedInAppUrl(url)).toBe(false);
+  });
+});
+
+describe("identifyUser (external ID)", () => {
+  let harness: ReturnType<typeof createHarness>;
+  beforeEach(() => {
+    harness = createHarness();
+  });
+
+  it("sends the external ID, without an email, on identified requests", async () => {
+    const client = harness.make();
+    await client.track("opened");
+    await client.identifyUser(" user_123 ", { identityToken });
+    await client.flush();
+    const [batch] = harness.to("/api/v1/app-events");
+    expect(batch?.body["externalId"]).toBe("user_123");
+    expect("email" in (batch?.body ?? {})).toBe(false);
+    expect(batch?.body["identityToken"]).toBe(identityToken);
+    expect(await client.getExternalId()).toBe("user_123");
+    expect(await client.getEmail()).toBeNull();
+  });
+
+  it("sends both identifiers when the user has an email", async () => {
+    const client = harness.make();
+    await client.identifyUser("user_123", {
+      email: "Jane@Example.com",
+      identityToken,
+    });
+    await client.setProfile({ firstName: "Jane" });
+    const [profile] = harness.to("/api/v1/app-attributes");
+    expect(profile?.body["externalId"]).toBe("user_123");
+    expect(profile?.body["email"]).toBe("jane@example.com");
+  });
+
+  it("asks the user token provider, never the email one, for external IDs", async () => {
+    const emailProvider = mock(async () => "seq_wid_email.token");
+    const userProvider = mock(
+      async (identity: { externalId: string; email: string | null }) =>
+        `seq_wid_user.${identity.externalId}`
+    );
+    const client = harness.make(emailProvider, {
+      userIdentityTokenProvider: userProvider,
+    });
+    await client.identifyUser("user_123");
+    await client.track("opened");
+    await client.flush();
+    expect(userProvider).toHaveBeenCalledWith({
+      externalId: "user_123",
+      email: null,
+    });
+    expect(emailProvider).not.toHaveBeenCalled();
+    expect(harness.to("/api/v1/app-events")[0]?.body["identityToken"]).toBe(
+      "seq_wid_user.user_123"
+    );
+  });
+
+  it("drops the previous user's queue when another user ID signs in", async () => {
+    const client = harness.make();
+    await client.identifyUser("user_1");
+    await client.track("for_user_1");
+    expect(await client.queuedEventCount()).toBe(1);
+    await client.identifyUser("user_2", { identityToken });
+    expect(await client.queuedEventCount()).toBe(0);
+  });
+
+  it("forgets a stored token when the identifiers change for the same user", async () => {
+    const client = harness.make();
+    await client.identifyUser("user_1", { identityToken: "seq_wid_old.1" });
+    // The email was added later: the old token verifies only without it.
+    await client.identifyUser("user_1", { email: "jane@example.com" });
+    expect(await client.identityCredentials()).toBeNull();
+  });
+
+  it("rejects an empty or overlong user ID", async () => {
+    const client = harness.make();
+    await client.identifyUser("   ", { identityToken });
+    await client.identifyUser("x".repeat(256), { identityToken });
+    expect(await client.getExternalId()).toBeNull();
+  });
+
+  it("hands the external ID to native reporters and clears it on reset", async () => {
+    const client = harness.make();
+    await client.identifyUser("user_123", { identityToken });
+    expect(await client.identityCredentials()).toEqual({
+      email: null,
+      externalId: "user_123",
+      identityToken,
+    });
+    await client.reset();
+    expect(await client.getExternalId()).toBeNull();
+    expect(await client.identityCredentials()).toBeNull();
   });
 });
